@@ -1,0 +1,832 @@
+//! Archive metadata catalogue and bounded, persistent processing queue.
+use anyhow::{ensure, Context, Result};
+use axum::{
+    extract::{DefaultBodyLimit, Path as ApiPath, State},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::{NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+};
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    roots: Vec<Root>,
+    public: PathBuf,
+    state: PathBuf,
+    repository: PathBuf,
+    worker_threads: usize,
+    max_depth: usize,
+    recipes: Vec<Recipe>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+struct Root {
+    label: String,
+    path: PathBuf,
+}
+#[derive(Clone, Deserialize)]
+struct Recipe {
+    date: String,
+    experiment: String,
+    #[serde(default)]
+    calibration_binding: Option<PathBuf>,
+    steps: Vec<Step>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+struct Step {
+    label: String,
+    commands: Vec<Vec<String>>,
+    completion: PathBuf,
+    link: String,
+}
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Entry {
+    id: String,
+    date: String,
+    experiment: String,
+    radar: String,
+    sources: BTreeSet<String>,
+    hours: BTreeSet<String>,
+    products: Vec<Product>,
+    supported: bool,
+    #[serde(default)]
+    calibration: Option<Calibration>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Product {
+    label: String,
+    link: String,
+    complete: bool,
+}
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Inventory {
+    updated: String,
+    scanning: bool,
+    directories: usize,
+    errors: usize,
+    skipped_at_depth: usize,
+    sources: Vec<String>,
+    experiments: Vec<Entry>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Job {
+    #[serde(default)]
+    calibration: Option<Calibration>,
+    id: String,
+    experiment_id: String,
+    date: String,
+    experiment: String,
+    state: String,
+    stage: String,
+    completed: usize,
+    total: usize,
+    cores: usize,
+    created: String,
+    updated: String,
+    message: String,
+}
+#[derive(Clone)]
+struct App {
+    config: Arc<Config>,
+    jobs: Arc<Mutex<Vec<Job>>>,
+    token: Arc<String>,
+    scanning: Arc<std::sync::atomic::AtomicBool>,
+}
+fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
+    fs::create_dir_all(path.parent().context("missing parent")?)?;
+    if path.starts_with("/srv/guisdap") {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755))?;
+    }
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    serde_json::to_writer(&mut tmp, v)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    if path.starts_with("/srv/guisdap") {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+fn id(date: &str, name: &str) -> String {
+    format!("{:x}", Sha256::digest(format!("{date}/{name}")))[..24].to_owned()
+}
+fn date_hour(name: &str) -> Option<(String, String)> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 11
+        || bytes[8] != b'_'
+        || !bytes[..8].iter().all(u8::is_ascii_digit)
+        || !bytes[9..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let d = NaiveDate::parse_from_str(&name[..8], "%Y%m%d").ok()?;
+    let hour = name[9..].parse::<u8>().ok()?;
+    if hour > 23 {
+        return None;
+    }
+    Some((d.to_string(), format!("{hour:02}:00")))
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Calibration {
+    revision: u64,
+    magic_constant: f64,
+    standard_error: Option<f64>,
+    included: usize,
+    total: usize,
+    sha256: String,
+}
+fn steps(c: &Config, r: &Recipe) -> Result<(Vec<Step>, Option<Calibration>)> {
+    let Some(binding) = &r.calibration_binding else {
+        return Ok((r.steps.clone(), None));
+    };
+    let source = fs::read_to_string(binding)?.trim().to_owned();
+    let bytes = fs::read(source)?;
+    let notebook: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let points = notebook["points"]
+        .as_array()
+        .context("invalid calibration notebook")?;
+    let values: Vec<_> = points
+        .iter()
+        .filter(|p| p["included"] == true)
+        .map(|p| -> Result<_> {
+            let raw = p["raw_ne_proxy_m3"].as_f64().context("missing raw power")?;
+            let old = p["original_calibration_multiplier"]
+                .as_f64()
+                .context("missing old constant")?;
+            let ratio = p["estimate"]["calibration_multiplier_ratio"]
+                .as_f64()
+                .context("missing correction")?;
+            let time = p["ion_start_unix"].as_f64().context("missing time")?;
+            Ok((raw / old, raw * ratio, time.to_bits()))
+        })
+        .collect::<Result<_>>()?;
+    let fit = guisdap_core::calibration::fit_gain(&values)
+        .context("No valid included calibration points")?;
+    let cal = Calibration {
+        revision: notebook["revision"].as_u64().context("missing revision")?,
+        magic_constant: fit.gain,
+        standard_error: fit.standard_error,
+        included: fit.points,
+        total: points.len(),
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    let dir = c.state.join("recipes").join(format!(
+        "{}-{}",
+        id(&r.date, &r.experiment),
+        &cal.sha256[..12]
+    ));
+    fs::create_dir_all(&dir)?;
+    if !dir.join("calibration.json").exists() {
+        fs::write(dir.join("calibration.json"), &bytes)?;
+    }
+    let mut result = r.steps.clone();
+    for (i, s) in result.iter_mut().enumerate() {
+        for args in &mut s.commands {
+            if args.first().is_some_and(|a| a == "fit-ion") {
+                let pos = args
+                    .iter()
+                    .position(|a| a == "--config")
+                    .context("fit config missing")?
+                    + 1;
+                let mut v: serde_json::Value =
+                    serde_json::from_slice(&fs::read(c.repository.join(&args[pos]))?)?;
+                v["calibration_multiplier"] = cal.magic_constant.into();
+                v["threads"] = c.worker_threads.into();
+                v["calibration_provenance"] = serde_json::to_value(&cal)?;
+                for field in ["output", "export"] {
+                    let base = v[field].as_str().context("missing fit destination")?;
+                    v[field] = format!("{base}-cal-{}", &cal.sha256[..12]).into();
+                }
+                s.link = format!(
+                    "ion.html?experiment={}&resolution={i}",
+                    id(&r.date, &r.experiment)
+                );
+                s.label = format!(
+                    "{} · C={:.4} · revision {}",
+                    s.label, cal.magic_constant, cal.revision
+                );
+                s.completion = PathBuf::from(v["export"].as_str().unwrap()).join("index.json");
+                let config = dir.join(format!("fit-{i}.json"));
+                if !config.exists() {
+                    write_json(&config, &v)?;
+                }
+                args[pos] = config.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // Per-experiment browser configuration; generated independently of live global defaults.
+    let public = c.public.join(id(&r.date, &r.experiment));
+    fs::create_dir_all(&public)?;
+    let datasets:Vec<_>=result.iter().filter(|s|s.label.starts_with("Ion-line")).map(|s|serde_json::json!({"label":s.label,"integration_s":if s.label.contains("15 s"){15}else{60},"data_url":format!("/guisdap/data/{}/index.json",s.completion.parent().unwrap().file_name().unwrap().to_string_lossy())})).collect();
+    let mut cfg: serde_json::Value =
+        serde_json::from_slice(&fs::read(c.repository.join("web/ion-config.json"))?)?;
+    cfg["datasets"] = datasets.into();
+    if let Some(url) = cfg["instruments_url"].as_str() {
+        if !url.starts_with('/') {
+            cfg["instruments_url"] = format!("/guisdap/{url}").into();
+        }
+    }
+    write_json(&public.join("ion-config.json"), &cfg)?;
+    Ok((result, Some(cal)))
+}
+fn complete(step: &Step) -> bool {
+    if !step.completion.is_file() {
+        return false;
+    }
+    if let Ok(bytes) = fs::read(step.completion.with_file_name("status.json")) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if v.get("phase").is_some() {
+                return v["phase"] == "complete";
+            }
+        }
+    }
+
+    let Ok(b) = fs::read(&step.completion) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) else {
+        return false;
+    };
+    if let Some(p) = v.get("processing") {
+        return p["phase"] == "complete";
+    }
+    v.get("frames")
+        .and_then(|a| a.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+fn recipe<'a>(c: &'a Config, e: &Entry) -> Option<&'a Recipe> {
+    c.recipes
+        .iter()
+        .find(|r| r.date == e.date && r.experiment == e.experiment)
+}
+fn add_products(c: &Config, entries: &mut BTreeMap<String, Entry>) {
+    for r in &c.recipes {
+        let key = id(&r.date, &r.experiment);
+        let e = entries.entry(key.clone()).or_insert_with(|| Entry {
+            id: key,
+            date: r.date.clone(),
+            experiment: r.experiment.clone(),
+            radar: r.experiment.rsplit('@').next().unwrap_or("").into(),
+            ..Entry::default()
+        });
+        match steps(c, r) {
+            Ok((steps, cal)) => {
+                e.supported = true;
+                e.calibration = cal;
+                e.products = r
+                    .steps
+                    .iter()
+                    .chain(
+                        steps
+                            .iter()
+                            .filter(|s| !r.steps.iter().any(|old| old.completion == s.completion)),
+                    )
+                    .filter(|s| s.completion.exists())
+                    .map(|s| Product {
+                        label: s.label.clone(),
+                        link: s.link.clone(),
+                        complete: complete(s),
+                    })
+                    .collect();
+            }
+            Err(err) => {
+                e.supported = false;
+                eprintln!("recipe {}: {err}", r.experiment);
+            }
+        }
+    }
+}
+fn scan(app: &App) -> Result<()> {
+    let c = &app.config;
+    let mut inventory = Inventory {
+        scanning: true,
+        sources: c.roots.iter().map(|r| r.label.clone()).collect(),
+        ..Inventory::default()
+    };
+    let mut entries = BTreeMap::new();
+    let publish = |inv: &mut Inventory, entries: &BTreeMap<String, Entry>| -> Result<()> {
+        inv.updated = Utc::now().to_rfc3339();
+        inv.experiments = entries.values().cloned().collect();
+        inv.experiments
+            .sort_by(|a, b| (&a.date, &a.experiment).cmp(&(&b.date, &b.experiment)));
+        write_json(&c.public.join("catalog.json"), inv)
+    };
+    add_products(c, &mut entries);
+    publish(&mut inventory, &entries)?;
+    let mut last_publish = std::time::Instant::now();
+    for root in &c.roots {
+        let mut pending = vec![(root.path.clone(), 0usize, None::<String>)];
+        while let Some((dir, depth, mut experiment)) = pending.pop() {
+            inventory.directories += 1;
+            if last_publish.elapsed().as_secs() >= 3 {
+                add_products(c, &mut entries);
+                publish(&mut inventory, &entries)?;
+                last_publish = std::time::Instant::now();
+            }
+            let name = dir.file_name().unwrap_or_default().to_string_lossy();
+            if name.contains('@') {
+                experiment = Some(name.to_string());
+            }
+            if let (Some(exp), Some((date, hour))) = (&experiment, date_hour(&name)) {
+                let key = id(&date, exp);
+                let e = entries.entry(key.clone()).or_insert_with(|| Entry {
+                    id: key,
+                    date,
+                    experiment: exp.clone(),
+                    radar: exp.rsplit('@').next().unwrap_or("").into(),
+                    ..Entry::default()
+                });
+                e.sources.insert(root.label.clone());
+                e.hours.insert(hour);
+                continue; // Do not enumerate the thousands of recordings in an hour directory.
+            }
+            if depth >= c.max_depth {
+                inventory.skipped_at_depth += 1;
+                continue;
+            }
+            let children = match fs::read_dir(&dir) {
+                Ok(v) => v,
+                Err(_) => {
+                    inventory.errors += 1;
+                    continue;
+                }
+            };
+            for child in children {
+                let child = match child {
+                    Ok(v) => v,
+                    Err(_) => {
+                        inventory.errors += 1;
+                        continue;
+                    }
+                };
+                let name = child.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.')
+                    || [
+                        "lost+found",
+                        "maarsy",
+                        "syisr",
+                        "digital_rf",
+                        "raw_voltage",
+                        "node_modules",
+                        "target",
+                        "venv",
+                        "digital_rf_data",
+                        "pansy_data",
+                        "kaira_meteor",
+                        "guisdap_processed_data",
+                    ]
+                    .contains(&name.as_str())
+                {
+                    continue;
+                }
+                match child.file_type() {
+                    Ok(t) if t.is_dir() => {
+                        pending.push((child.path(), depth + 1, experiment.clone()))
+                    }
+                    Err(_) => inventory.errors += 1,
+                    _ => {}
+                }
+            }
+            if inventory.directories.is_multiple_of(1000) {
+                add_products(c, &mut entries);
+                publish(&mut inventory, &entries)?;
+            }
+        }
+    }
+    add_products(c, &mut entries);
+    inventory.scanning = false;
+    publish(&mut inventory, &entries)
+}
+fn load_inventory(c: &Config) -> Result<Inventory> {
+    Ok(serde_json::from_slice(&fs::read(
+        c.public.join("catalog.json"),
+    )?)?)
+}
+fn start_scan(app: App) {
+    use std::sync::atomic::Ordering;
+    if app.scanning.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Err(e) = scan(&app) {
+            eprintln!("inventory: {e:#}");
+        }
+        app.scanning.store(false, Ordering::SeqCst);
+    });
+}
+fn save_jobs(app: &App, jobs: &Vec<Job>) -> Result<()> {
+    write_json(&app.config.state.join("jobs.json"), jobs)?;
+    write_json(&app.config.public.join("queue.json"), jobs)
+}
+fn authorized(h: &HeaderMap, app: &App) -> bool {
+    h.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == format!("Bearer {}", app.token))
+}
+async fn enqueue(
+    State(app): State<App>,
+    ApiPath(key): ApiPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Job>, (StatusCode, String)> {
+    if !authorized(&headers, &app) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Enter the server processing key.".into(),
+        ));
+    }
+    let inv = load_inventory(&app.config)
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let e = inv
+        .experiments
+        .iter()
+        .find(|e| e.id == key)
+        .ok_or((StatusCode::NOT_FOUND, "Experiment not in inventory".into()))?;
+    let recipe = recipe(&app.config, e).ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "No validated processing recipe for this experiment/date.".into(),
+    ))?;
+    let mut jobs = app.jobs.lock().unwrap();
+    if let Some(j) = jobs
+        .iter()
+        .find(|j| j.experiment_id == key && ["queued", "running"].contains(&j.state.as_str()))
+    {
+        return Ok(Json(j.clone()));
+    }
+    let (steps, calibration) = steps(&app.config, recipe)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    if steps.iter().all(complete) {
+        return Err((
+            StatusCode::CONFLICT,
+            "All configured products are already complete.".into(),
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    let job = Job {
+        calibration,
+        id: format!("{}-{}", key, Utc::now().timestamp_millis()),
+        experiment_id: key,
+        date: e.date.clone(),
+        experiment: e.experiment.clone(),
+        state: "queued".into(),
+        stage: "Waiting for compute slot".into(),
+        completed: 0,
+        total: steps.len(),
+        cores: app.config.worker_threads,
+        created: now.clone(),
+        updated: now,
+        message: String::new(),
+    };
+    write_json(
+        &app.config.state.join(format!("{}.steps.json", job.id)),
+        &steps,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    jobs.push(job.clone());
+    save_jobs(&app, &jobs).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(job))
+}
+async fn rescan(State(app): State<App>, headers: HeaderMap) -> Result<StatusCode, StatusCode> {
+    if !authorized(&headers, &app) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    start_scan(app);
+    Ok(StatusCode::ACCEPTED)
+}
+fn update(app: &App, key: &str, modify: impl FnOnce(&mut Job)) -> Result<()> {
+    let mut jobs = app.jobs.lock().unwrap();
+    let j = jobs
+        .iter_mut()
+        .find(|j| j.id == key)
+        .context("missing job")?;
+    modify(j);
+    j.updated = Utc::now().to_rfc3339();
+    save_jobs(app, &jobs)
+}
+fn run_job(app: &App, job: &Job) -> Result<()> {
+    let c = &app.config;
+    let steps: Vec<Step> =
+        serde_json::from_slice(&fs::read(c.state.join(format!("{}.steps.json", job.id)))?)?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(c.state.join(format!("{}.log", job.id)))?;
+    for (i, step) in steps.iter().enumerate() {
+        update(app, &job.id, |j| {
+            j.stage = step.label.clone();
+            j.completed = i;
+        })?;
+        if !complete(step) {
+            for args in &step.commands {
+                ensure!(!args.is_empty(), "empty command");
+                let status = Command::new(c.repository.join("target/release/guisdap-worker"))
+                    .args(args)
+                    .current_dir(&c.repository)
+                    .env("RAYON_NUM_THREADS", c.worker_threads.to_string())
+                    .stdout(log.try_clone()?)
+                    .stderr(log.try_clone()?)
+                    .status()?;
+                ensure!(
+                    status.success(),
+                    "{} failed ({status}); inspect the server job log",
+                    step.label
+                );
+            }
+            ensure!(
+                complete(step),
+                "{} exited without a complete product",
+                step.label
+            );
+        }
+        update(app, &job.id, |j| j.completed = i + 1)?;
+    }
+    Ok(())
+}
+fn worker(app: App) {
+    std::thread::spawn(move || loop {
+        let next = {
+            let mut jobs = app.jobs.lock().unwrap();
+            let j = jobs.iter_mut().find(|j| j.state == "queued");
+            if let Some(j) = j {
+                j.state = "running".into();
+                j.updated = Utc::now().to_rfc3339();
+                let next = Some(j.clone());
+                if let Err(e) = save_jobs(&app, &jobs) {
+                    eprintln!("queue write: {e}");
+                    None
+                } else {
+                    next
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(j) = next {
+            let result = run_job(&app, &j);
+            let _ = update(&app, &j.id, |j| match result {
+                Ok(()) => {
+                    j.state = "complete".into();
+                    j.stage = "Complete".into();
+                }
+                Err(e) => {
+                    j.state = "failed".into();
+                    j.message = e.to_string();
+                }
+            });
+            // Refresh availability without rescanning the archive.
+            if let Ok(mut inv) = load_inventory(&app.config) {
+                let mut entries = inv
+                    .experiments
+                    .into_iter()
+                    .map(|e| (e.id.clone(), e))
+                    .collect();
+                add_products(&app.config, &mut entries);
+                inv.experiments = entries.into_values().collect();
+                let _ = write_json(&app.config.public.join("catalog.json"), &inv);
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+}
+fn monitor(app: App) {
+    std::thread::spawn(move || loop {
+        let publish = || -> Result<()> {
+            let mut jobs = app.jobs.lock().unwrap().clone();
+            for job in &mut jobs {
+                if job.state != "running" {
+                    continue;
+                }
+                let steps: Vec<Step> = serde_json::from_slice(&fs::read(
+                    app.config.state.join(format!("{}.steps.json", job.id)),
+                )?)?;
+                if let Some(step) = steps.get(job.completed) {
+                    if let Ok(bytes) = fs::read(step.completion.with_file_name("status.json")) {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            job.stage = format!(
+                                "{} · {} / {} intervals",
+                                step.label, v["completed"], v["total"]
+                            );
+                        }
+                    }
+                }
+            }
+            write_json(&app.config.public.join("queue.json"), &jobs)?;
+            // Switch each default resolution only after its calibrated index exists.
+            for r in &app.config.recipes {
+                let (steps, _) = steps(&app.config, r)?;
+                let mut cfg: serde_json::Value = serde_json::from_slice(&fs::read(
+                    app.config.repository.join("web/ion-config.json"),
+                )?)?;
+                let mut changed = false;
+                for (i, s) in steps
+                    .iter()
+                    .filter(|s| s.label.starts_with("Ion-line"))
+                    .enumerate()
+                {
+                    if s.completion.exists() {
+                        let dt = if s.label.contains("15 s") { 15 } else { 60 };
+                        let native = s.label.contains("native");
+                        if let Some(datasets) = cfg["datasets"].as_array_mut() {
+                            for d in datasets {
+                                if d["integration_s"] == dt
+                                    && d["label"].as_str().unwrap_or("").contains("native")
+                                        == native
+                                {
+                                    d["data_url"] = format!(
+                                        "data/{}/index.json",
+                                        s.completion
+                                            .parent()
+                                            .unwrap()
+                                            .file_name()
+                                            .unwrap()
+                                            .to_string_lossy()
+                                    )
+                                    .into();
+                                    changed = true;
+                                }
+                            }
+                        }
+                        let _ = i;
+                    }
+                }
+                if changed {
+                    write_json(&app.config.public.join("default-ion-config.json"), &cfg)?;
+                }
+            }
+            if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut inv = load_inventory(&app.config)?;
+                let mut entries = inv
+                    .experiments
+                    .into_iter()
+                    .map(|e| (e.id.clone(), e))
+                    .collect();
+                add_products(&app.config, &mut entries);
+                inv.experiments = entries.into_values().collect();
+                inv.updated = Utc::now().to_rfc3339();
+                write_json(&app.config.public.join("catalog.json"), &inv)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = publish() {
+            eprintln!("queue monitor: {e}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    });
+}
+
+#[tokio::main(worker_threads = 2)]
+async fn main() -> Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .context("usage: catalog-store CONFIG")?;
+    let c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        c.worker_threads > 0 && c.worker_threads <= 128,
+        "worker_threads must be 1..128"
+    );
+    fs::create_dir_all(&c.state)?;
+    fs::create_dir_all(&c.public)?;
+    let token = fs::read_to_string(c.state.join("processing-key"))?
+        .trim()
+        .to_owned();
+    ensure!(token.len() >= 32, "processing key too short");
+    let mut jobs: Vec<Job> = match fs::read(c.state.join("jobs.json")) {
+        Ok(b) => serde_json::from_slice(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e.into()),
+    };
+    for j in &mut jobs {
+        if j.state == "running" {
+            j.state = "interrupted".into();
+            j.message = "Service restarted; inspect outputs before retrying".into();
+        }
+    }
+    let app = App {
+        config: Arc::new(c),
+        jobs: Arc::new(Mutex::new(jobs)),
+        token: Arc::new(token),
+        scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    save_jobs(&app, &app.jobs.lock().unwrap())?;
+    start_scan(app.clone());
+    worker(app.clone());
+    monitor(app.clone());
+    let router = Router::new()
+        .route("/guisdap/api/catalog/jobs/{id}", post(enqueue))
+        .route("/guisdap/api/catalog/rescan", post(rescan))
+        .route("/guisdap/api/catalog/health", get(|| async { "ok" }))
+        .layer(DefaultBodyLimit::max(1024))
+        .with_state(app);
+    axum::serve(
+        tokio::net::TcpListener::bind("127.0.0.1:8092").await?,
+        router,
+    )
+    .await?;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dates_are_calendar_dates_not_arbitrary_digits() {
+        assert_eq!(
+            date_hour("20221102_17"),
+            Some(("2022-11-02".into(), "17:00".into()))
+        );
+        assert!(date_hour("20220230_12").is_none());
+        assert!(date_hour("20221102_24").is_none());
+        assert!(date_hour("20221102_17_extra").is_none());
+        assert!(date_hour("é20221102_1").is_none());
+    }
+    #[test]
+    fn duplicate_sources_share_identity_but_versions_do_not() {
+        assert_eq!(id("2022-11-02", "beata@uhf"), id("2022-11-02", "beata@uhf"));
+        assert_ne!(
+            id("2022-11-02", "beata@uhf"),
+            id("2022-11-02", "beata2@uhf")
+        );
+    }
+    #[test]
+    fn archive_scan_deduplicates_sources_and_stops_before_record_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for disk in ["a", "b"] {
+            fs::create_dir_all(root.join(disk).join("beata@uhf/20221102_17/do-not-descend"))
+                .unwrap();
+        }
+        let c = Config {
+            roots: vec![
+                Root {
+                    label: "a".into(),
+                    path: root.join("a"),
+                },
+                Root {
+                    label: "b".into(),
+                    path: root.join("b"),
+                },
+                Root {
+                    label: "offline".into(),
+                    path: root.join("absent"),
+                },
+            ],
+            public: root.join("public"),
+            state: root.join("state"),
+            repository: root.into(),
+            worker_threads: 128,
+            max_depth: 8,
+            recipes: vec![],
+        };
+        let app = App {
+            config: Arc::new(c),
+            jobs: Arc::new(Mutex::new(vec![])),
+            token: Arc::new("secret".into()),
+            scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        scan(&app).unwrap();
+        let inv = load_inventory(&app.config).unwrap();
+        assert!(!inv.scanning);
+        assert_eq!(inv.errors, 1);
+        assert_eq!(inv.experiments.len(), 1);
+        assert_eq!(inv.experiments[0].sources.len(), 2);
+        assert_eq!(inv.experiments[0].hours.len(), 1);
+        assert_eq!(inv.directories, 7);
+        assert!(!authorized(&HeaderMap::new(), &app));
+    }
+    #[test]
+    fn partial_products_do_not_count_as_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = tmp.path().join("index.json");
+        let s = Step {
+            label: "test".into(),
+            commands: vec![],
+            completion: index.clone(),
+            link: String::new(),
+        };
+        assert!(!complete(&s));
+        write_json(
+            &index,
+            &serde_json::json!({"processing":{"phase":"running"}}),
+        )
+        .unwrap();
+        assert!(!complete(&s));
+        write_json(
+            &index,
+            &serde_json::json!({"processing":{"phase":"complete"}}),
+        )
+        .unwrap();
+        assert!(complete(&s));
+        write_json(&index, &serde_json::json!({"frames":[]})).unwrap();
+        assert!(!complete(&s));
+    }
+}

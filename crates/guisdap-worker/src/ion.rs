@@ -36,6 +36,8 @@ pub struct Config {
     pub fit_collisions_below_km: f64,
     pub antenna_efficiency: f64,
     pub calibration_multiplier: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_provenance: Option<serde_json::Value>,
     pub threads: usize,
     #[serde(default)]
     pub streaming: bool,

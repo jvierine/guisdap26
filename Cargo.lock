@@ -520,6 +520,7 @@ dependencies = [
 name = "guisdap-web"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "guisdap-core",
  "guisdap-ion",
  "js-sys",

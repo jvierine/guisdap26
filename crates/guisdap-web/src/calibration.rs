@@ -310,7 +310,10 @@ fn point(c: &Calibration) -> Result<Point, String> {
 }
 fn preview(c: &Calibration) {
     match point(c) {
-        Err(e) => text("cal-result", &e),
+        Err(e) => {
+            text("cal-result", &e);
+            text("cal-result-details", "");
+        }
         Ok(p) => {
             let a = &p.estimate;
             if let Ok(Some(svg)) = el("cal-candidates").query_selector("svg") {
@@ -328,11 +331,13 @@ fn preview(c: &Calibration) {
                 let _ = marker.set_attribute("stroke", "#a9fff3");
                 let _ = svg.append_child(&marker);
             }
-            text("cal-result",&format!("Altitude {:.1} km · one-minute fit {}–{} UTC · status {} · residual {:.2}\nTe {:.0} ± {} K; Ti {:.0} ± {} K; Te/Ti {:.3}\nCold Ne {:.4e}; thermal-corrected Ne {:.4e} m⁻³\nThermal frequency term {:.3} MHz²; Debye length {:.4} m; k²λD² {:.4}; power denominator {:.4}\nFitted Ne {:.4e} m⁻³; fitted-power denominator {:.4}\nEstimated magic constant {:.4} (dimensionless)\nInput product magic constant {:.4}; relative density correction ×{:.4}\n{}",
+            let ratio = p.magic_constant / p.original_calibration_multiplier;
+            text("cal-result", &format!("Density is {} with the current constant {:.4}.\nThis point estimates C = {:.4}: {} electron density by {:.1}% (×{:.3}).\n{:.1} km · {}–{} UTC · {}", if ratio >= 1. { "underestimated" } else { "overestimated" }, p.original_calibration_multiplier, p.magic_constant, if ratio >= 1. { "increase" } else { "decrease" }, (ratio - 1.).abs()*100., ratio, p.altitude_km, utc(p.ion_start_unix), utc(p.ion_end_unix), if p.included { "eligible for inclusion" } else { "excluded by default: review fit quality" }));
+            text("cal-result-details",&format!("Altitude {:.1} km · one-minute fit {}–{} UTC · status {} · residual {:.2}\nTe {:.0} ± {} K; Ti {:.0} ± {} K; Te/Ti {:.3}\nCold Ne {:.4e}; thermal-corrected Ne {:.4e} m⁻³\nThermal frequency term {:.3} MHz²; Debye length {:.4} m; k²λD² {:.4}; power denominator {:.4}\nFitted Ne {:.4e} m⁻³; fitted-power denominator {:.4}\nEstimated magic constant {:.4} (dimensionless)\nInput product magic constant {:.4}; relative density correction ×{:.4}\n{}",
                 p.altitude_km,utc(p.ion_start_unix),utc(p.ion_end_unix),p.fit_status,p.residual_score,p.te_k,p.fit_standard_error[2].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),p.ti_k,p.fit_standard_error[1].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),a.temperature_ratio,a.cold_density_m3,a.plasma_density_m3,a.thermal_frequency_squared_hz2/1e12,a.debye_length_m,a.k2_debye2,a.ion_power_denominator,p.fitted_ne_m3,a.fitted_ion_power_denominator,p.magic_constant,p.original_calibration_multiplier,a.calibration_multiplier_ratio,
                 if p.included {"Eligible for inclusion. Confirm the altitude association before saving."} else {"Flagged fit or k²λD² ≥ 0.1: saved excluded by default. Thermal approximation / fit quality requires review."}));
-            let current = el("cal-result").text_content().unwrap_or_default();
-            text("cal-result",&format!("{current}\nMeasured raw 10 µs Ne proxy {:.4e}; equivalent zero-lag raw Ne {:.4e} m⁻³\nModel short-lag response {:.5}; {} samples · {:.0} s × {:.1} km requested window",p.raw_ne_proxy_m3,p.equivalent_zero_lag_raw_ne_m3,p.short_lag_response,p.raw_sample_count,p.power_time_window_s,p.power_altitude_width_km));
+            let current = el("cal-result-details").text_content().unwrap_or_default();
+            text("cal-result-details",&format!("{current}\nMeasured raw 10 µs Ne proxy {:.4e}; equivalent zero-lag raw Ne {:.4e} m⁻³\nModel short-lag response {:.5}; {} samples · {:.0} s × {:.1} km requested window",p.raw_ne_proxy_m3,p.equivalent_zero_lag_raw_ne_m3,p.short_lag_response,p.raw_sample_count,p.power_time_window_s,p.power_altitude_width_km));
         }
     }
     markers(&c.app.borrow(), c);
@@ -495,10 +500,19 @@ fn table(state: &Cal) {
     }
     scatter.push_str("</svg>");
     el("cal-power-scatter").set_inner_html(&scatter);
-    text("cal-fit-summary",&match gain_fit {
-        Some(f)=>format!("Estimated magic constant C = {:.4}{} (dimensionless); predicted = C × measured at C=1 · {} included points, {} one-minute time groups. Band: ±1σ uncertainty of the fitted line (30% opacity); conditional on measured raw Ne and the plasma model. This is not a prediction interval and excludes systematic errors.",f.gain,f.standard_error.map(|se|format!(" ± {se:.4}")).unwrap_or_else(||"; uncertainty unavailable—include points from at least two one-minute fits".into()),f.points,f.time_clusters),
-        None=>"Include calibration points to estimate the absolute magic constant.".into(),
-    });
+    text(
+        "cal-fit-summary",
+        &match gain_fit {
+            Some(f) => {
+                let correction = c.settings.as_ref().map(|s| {
+                let ratio=f.gain/s.calibration_multiplier;
+                format!(" Compared with the input constant {:.4}, {} electron density by {:.1}% (×{:.3}); the old density is {}.", s.calibration_multiplier, if ratio>=1. {"increase"} else {"decrease"}, (ratio-1.).abs()*100., ratio, if ratio>=1. {"underestimated"} else {"overestimated"})
+            }).unwrap_or_default();
+                format!("Magic constant C = {:.4}{}.{correction} {} included points from {} one-minute intervals. Uncertainty is ±1σ and excludes systematic errors. Processing uses a saved snapshot; editing points does not change existing results.",f.gain,f.standard_error.map(|se|format!(" ± {se:.4}")).unwrap_or_default(),f.points,f.time_clusters)
+            }
+            None => "Include calibration points to estimate the absolute magic constant.".into(),
+        },
+    );
     markers(&c.app.borrow(), &c);
     let n = c.points.len();
     save(&c);
@@ -829,7 +843,10 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
                     "Point saved. Click another feature or select another altitude.",
                 );
             }
-            Err(e) => text("cal-result", &e),
+            Err(e) => {
+                text("cal-result", &e);
+                text("cal-result-details", "");
+            }
         }
     })?;
     for broad in 0..4 {

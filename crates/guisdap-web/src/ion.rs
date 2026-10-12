@@ -583,7 +583,7 @@ fn render(v: &Viewer) {
     colors::sync(v);
     text("fit-uncertainty", &v.data.uncertainty);
     text("fit-assumptions", &v.data.limitations.join(". "));
-    text("fit-calibration-used",&v.data.calibration.as_ref().map(|c|format!("Magic constant used: {:.4} · antenna efficiency: {:.3} · these values produced the displayed fits; plasma-line calibration estimates are not automatically applied.",c.magic_constant,c.antenna_efficiency)).unwrap_or_else(||"Magic constant used: not recorded in this product.".into()));
+    text("fit-calibration-used",&v.data.calibration.as_ref().map(|c|format!("Magic constant used: {:.4} · antenna efficiency: {:.3} · calibration recorded in this analysis product.",c.magic_constant,c.antenna_efficiency)).unwrap_or_else(||"Magic constant used: not recorded in this product.".into()));
     instruments::render(v);
     let p = selected(v);
     let g = &p.gates[v.gate];
@@ -1000,7 +1000,21 @@ fn seconds(s: &str) -> Option<f64> {
 }
 #[wasm_bindgen]
 pub async fn start_ion() -> Result<(), JsValue> {
-    let location: Location = json("ion-config.json").await?;
+    let config_url = super::experiment_config("ion-config.json");
+    let location: Location = if config_url == "ion-config.json"
+        && !web_sys::window()
+            .unwrap()
+            .location()
+            .search()?
+            .contains("original=1")
+    {
+        match json("catalog/default-ion-config.json").await {
+            Ok(v) => v,
+            Err(_) => json(&config_url).await?,
+        }
+    } else {
+        json(&config_url).await?
+    };
     if location.datasets.is_empty() {
         return Err(error("no configured resolutions"));
     }
@@ -1009,7 +1023,19 @@ pub async fn start_ion() -> Result<(), JsValue> {
     } else {
         None
     };
-    let data: Data = json(&location.datasets[0].data_url).await?;
+    let resolution = web_sys::window()
+        .unwrap()
+        .location()
+        .search()?
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|p| {
+            p.strip_prefix("resolution=")
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        .min(location.datasets.len() - 1);
+    let data: Data = json(&location.datasets[resolution].data_url).await?;
     if data.schema != "beata22-ionfit-v2" || data.profiles.is_empty() {
         return Err(error("unsupported or empty ion product"));
     }
@@ -1058,7 +1084,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
         lower: 0,
         upper,
         datasets: location.datasets,
-        resolution: 0,
+        resolution,
         details: BTreeMap::new(),
         loading: BTreeSet::new(),
         map_key: std::cell::Cell::new(None),
@@ -1289,6 +1315,13 @@ pub async fn start_ion() -> Result<(), JsValue> {
     }
     for (id, processing) in [("show-analysis", false), ("show-processing", true)] {
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            if processing {
+                let _ = web_sys::window()
+                    .unwrap()
+                    .location()
+                    .set_href("catalog.html#queue");
+                return;
+            }
             let (show, hide) = if processing {
                 ("processing-view", "analysis-view")
             } else {

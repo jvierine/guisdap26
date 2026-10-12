@@ -18,3 +18,5 @@ main{overflow-anchor:none}.scrubber{overflow-anchor:none}
 
 .animation-grid{grid-template-columns:minmax(0,2fr) minmax(340px,1fr)}
 @media(max-width:850px){.animation-grid{grid-template-columns:1fr}}
+
+.experiment-tabs{display:flex;gap:8px;margin:16px 0}.experiment-tabs>a{padding:10px 20px;border:1px solid #405461;border-radius:5px;color:#d9e4ec;text-decoration:none}.experiment-tabs>a[aria-current=page]{background:#233a48;border-color:#e6b751;color:#fff}

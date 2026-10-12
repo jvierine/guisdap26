@@ -477,6 +477,11 @@ fn analyze(config: PathBuf, node: usize, nodes: usize) -> Result<()> {
 fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("output parent")?;
     fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    if path.starts_with("/srv/guisdap") {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+    }
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(bytes)?;
     #[cfg(unix)]

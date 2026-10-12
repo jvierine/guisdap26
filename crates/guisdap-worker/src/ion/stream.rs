@@ -181,7 +181,7 @@ fn publish(cfg: &Config, profiles: &[Value], phase: &str, started: i64) -> Resul
     if cfg.model_selection_below_km.is_some() {
         document["limitations"].as_array_mut().unwrap().push(json!("Below the configured model-selection altitude, compare free/tied temperatures and free/zero collision models using chi-square + parameter_count*ln(real_components). Conditional diagonal-noise criterion, not a calibrated probability; selected constraints are stored per gate."));
     }
-    document["calibration"] = json!({"magic_constant":cfg.calibration_multiplier,"antenna_efficiency":cfg.antenna_efficiency});
+    document["calibration"] = json!({"magic_constant":cfg.calibration_multiplier,"antenna_efficiency":cfg.antenna_efficiency,"provenance":cfg.calibration_provenance});
     let bytes = serde_json::to_vec(&document)?;
     let status = serde_json::to_vec(&document["processing"])?;
     super::super::atomic_bytes(&cfg.export.join("status.json"), &status)?;

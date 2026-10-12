@@ -1,0 +1,11 @@
+[Unit]
+Description=RUISDAP experiment inventory and processing queue
+[Service]
+WorkingDirectory=/home/j/src/guisdap26
+ExecStart=/home/j/src/guisdap26/target/release/catalog-store /home/j/src/guisdap26/config/catalog-avaruus.json
+Restart=on-failure
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+[Install]
+WantedBy=default.target

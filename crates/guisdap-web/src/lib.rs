@@ -1,6 +1,7 @@
 //! Static-hosted browser application. Data selection, scaling, UI and WebGL live in Rust.
 #![cfg(target_arch = "wasm32")]
 mod calibration;
+mod catalog;
 mod ion;
 use guisdap_core::{merge_bands, native_spectra};
 use serde::Deserialize;
@@ -70,6 +71,23 @@ struct App {
     cache: std::collections::VecDeque<(usize, Vec<f32>)>,
 }
 type State = Rc<RefCell<App>>;
+fn experiment_config(default: &str) -> String {
+    let query = web_sys::window()
+        .unwrap()
+        .location()
+        .search()
+        .unwrap_or_default();
+    let id = query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|p| p.strip_prefix("experiment="));
+    match id {
+        Some(id) if id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("catalog/{id}/{default}")
+        }
+        _ => default.into(),
+    }
+}
 fn doc() -> web_sys::Document {
     web_sys::window().unwrap().document().unwrap()
 }
@@ -701,7 +719,7 @@ fn on(
 }
 #[wasm_bindgen]
 pub async fn start() -> Result<(), JsValue> {
-    let cfg: Config = json("config.json").await?;
+    let cfg: Config = json(&experiment_config("config.json")).await?;
     let query = web_sys::window().unwrap().location().search()?;
     let param = |key: &str| {
         query.trim_start_matches('?').split('&').find_map(|part| {

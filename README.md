@@ -8,6 +8,7 @@ The GUI uses Rust, WebAssembly and WebGL. The multicore Rust backend scales to
 at least 128 cores and stores analysis products in HDF5. The GUI can run on a
 separate static web server, using exported analysis products.
 
+[Experiment calendar and processing queue](http://avaruus.uit.no/guisdap/catalog.html) ·
 [Plasma-line browser](http://avaruus.uit.no/guisdap/) ·
 [Ion-line browser](http://avaruus.uit.no/guisdap/ion.html)
 

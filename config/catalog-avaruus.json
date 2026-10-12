@@ -1,0 +1,128 @@
+{
+  "roots": [
+    {
+      "label": "Revontuli BEATA study",
+      "path": "/nfs/revontuli/data/oliver/02112022/beata_cp1_2.2u_AA@uhf"
+    },
+    {
+      "label": "Urdr EISCAT archive",
+      "path": "/nfs/urdr/data"
+    },
+    {
+      "label": "Revontuli archive",
+      "path": "/nfs/revontuli/data"
+    }
+  ],
+  "public": "/srv/guisdap/catalog",
+  "state": "/home/j/data/guisdap/catalog-state",
+  "repository": "/home/j/src/guisdap26",
+  "worker_threads": 128,
+  "max_depth": 8,
+  "recipes": [
+    {
+      "date": "2022-11-02",
+      "experiment": "beata_cp1_2.2u_AA@uhf",
+      "calibration_binding": "/home/j/data/guisdap/catalog-state/calibration-source",
+      "steps": [
+        {
+          "label": "Ion-line 60 s \u00b7 full",
+          "commands": [
+            [
+              "fit-ion",
+              "--config",
+              "config/ion-fit-msis-iri-full-60s.json"
+            ]
+          ],
+          "completion": "/srv/guisdap/data/2022-11-02-ionfit-full-60s-msis-iri-v5/index.json",
+          "link": "ion.html?original=1&resolution=1"
+        },
+        {
+          "label": "Ion-line 15 s \u00b7 full",
+          "commands": [
+            [
+              "fit-ion",
+              "--config",
+              "config/ion-fit-msis-iri-full-15s.json"
+            ]
+          ],
+          "completion": "/srv/guisdap/data/2022-11-02-ionfit-full-15s-msis-iri-v5/index.json",
+          "link": "ion.html?original=1&resolution=0"
+        },
+        {
+          "label": "Ion-line 60 s \u00b7 native",
+          "commands": [
+            [
+              "fit-ion",
+              "--config",
+              "config/ion-fit-msis-iri-native-60s.json"
+            ]
+          ],
+          "completion": "/srv/guisdap/data/2022-11-02-ionfit-native-60s-msis-iri-v5/index.json",
+          "link": "ion.html?original=1&resolution=3"
+        },
+        {
+          "label": "Ion-line 15 s \u00b7 native",
+          "commands": [
+            [
+              "fit-ion",
+              "--config",
+              "config/ion-fit-msis-iri-native-15s.json"
+            ]
+          ],
+          "completion": "/srv/guisdap/data/2022-11-02-ionfit-native-15s-msis-iri-v5/index.json",
+          "link": "ion.html?original=1&resolution=2"
+        },
+        {
+          "label": "Plasma-line 60 s",
+          "commands": [
+            [
+              "average-plasma",
+              "--input",
+              "/home/j/data/guisdap/2022-11-02-full-v5",
+              "--output",
+              "/home/j/data/guisdap/2022-11-02-plasma-full-60s-v1",
+              "--integration-s",
+              "60",
+              "--threads",
+              "128"
+            ],
+            [
+              "export",
+              "--input",
+              "/home/j/data/guisdap/2022-11-02-plasma-full-60s-v1",
+              "--output",
+              "/srv/guisdap/data/2022-11-02-plasma-full-60s-v1"
+            ]
+          ],
+          "completion": "/srv/guisdap/data/2022-11-02-plasma-full-60s-v1/index.json",
+          "link": "./?resolution=1"
+        },
+        {
+          "label": "Plasma-line 15 s",
+          "commands": [
+            [
+              "average-plasma",
+              "--input",
+              "/home/j/data/guisdap/2022-11-02-full-v5",
+              "--output",
+              "/home/j/data/guisdap/2022-11-02-plasma-full-15s-v1",
+              "--integration-s",
+              "15",
+              "--threads",
+              "128"
+            ],
+            [
+              "export",
+              "--input",
+              "/home/j/data/guisdap/2022-11-02-plasma-full-15s-v1",
+              "--output",
+              "/srv/guisdap/data/2022-11-02-plasma-full-15s-v1"
+            ]
+          ],
+          "completion": "/srv/guisdap/data/2022-11-02-plasma-full-15s-v1/index.json",
+          "link": "./?resolution=0"
+        }
+      ]
+    }
+  ]
+}
