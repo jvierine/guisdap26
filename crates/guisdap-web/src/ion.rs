@@ -44,8 +44,15 @@ struct Fit {
     standard_error: [Option<f64>; 5],
     reduced_chi_square: f64,
     iterations: usize,
-    predicted: Vec<[f64; 2]>,
+    #[serde(default)]
+    model_curve: Vec<ModelPoint>,
     standardized_residual: Vec<[f64; 2]>,
+}
+#[derive(Deserialize)]
+struct ModelPoint {
+    lag_s: f64,
+    value: [f64; 2],
+    standard_error: Option<[f64; 2]>,
 }
 #[derive(Deserialize)]
 struct Plasma {
@@ -59,6 +66,8 @@ struct Viewer {
     data: Data,
     time: usize,
     gate: usize,
+    lower: usize,
+    upper: usize,
 }
 fn clock(t: f64) -> String {
     let s = (t.round() as i64).rem_euclid(86400);
@@ -89,7 +98,9 @@ fn value(p: &Plasma, i: usize) -> f64 {
 fn profile(v: &Viewer, param: usize) -> String {
     let mut s = svg(310., 510.);
     let p = &v.data.profiles[v.time];
-    let y = |h: f64| 460. - (h - 40.) / 660. * 420.;
+    let bottom = p.gates[v.lower].lower_km;
+    let top = p.gates[v.upper].upper_km;
+    let y = |h: f64| 460. - (h - bottom) / (top - bottom) * 420.;
     let (min, max, ticks): (f64, f64, Vec<(f64, String)>) = match param {
         0 => (
             8.,
@@ -128,7 +139,7 @@ fn profile(v: &Viewer, param: usize) -> String {
     };
     let x = |a: f64| 65. + (a - min) / (max - min) * 225.;
     let transform = |a: f64| if param == 0 { a.max(1.).log10() } else { a };
-    for h in (50..=700).step_by(50) {
+    for h in altitude_ticks(bottom, top) {
         line(&mut s, 65., y(h as f64), 290., y(h as f64), "#233c4c");
         label(&mut s, 57., y(h as f64) + 4., &h.to_string(), "end");
     }
@@ -138,7 +149,7 @@ fn profile(v: &Viewer, param: usize) -> String {
     }
     label(&mut s, 65., 24., "Altitude / km", "start");
     s.push_str("<defs><clipPath id='fit-area'><rect x='64' y='39' width='227' height='423'/></clipPath></defs><g clip-path='url(#fit-area)'>");
-    for (i, g) in p.gates.iter().enumerate() {
+    for (i, g) in p.gates.iter().enumerate().take(v.upper + 1).skip(v.lower) {
         if let Some(f) = &g.result {
             let z = value(&f.plasma, param);
             let a = transform(z);
@@ -177,6 +188,133 @@ fn profile(v: &Viewer, param: usize) -> String {
     s.push_str("</g></svg>");
     s
 }
+
+fn altitude_ticks(bottom: f64, top: f64) -> Vec<i32> {
+    let step = if top - bottom <= 150. { 10 } else { 50 };
+    let first = (bottom / step as f64).ceil() as i32 * step;
+    (first..=top.floor() as i32)
+        .step_by(step as usize)
+        .collect()
+}
+fn plasma_color(t: f64) -> String {
+    // Samples of the perceptually ordered plasma palette, linearly interpolated.
+    let stops = [
+        [13., 8., 135.],
+        [84., 3., 160.],
+        [139., 10., 165.],
+        [185., 50., 137.],
+        [219., 92., 104.],
+        [244., 136., 73.],
+        [254., 188., 43.],
+        [240., 249., 33.],
+    ];
+    let p = t.clamp(0., 1.) * (stops.len() - 1) as f64;
+    let a = (p.floor() as usize).min(stops.len() - 2);
+    let f = p - a as f64;
+    let rgb = [0, 1, 2].map(|i| (stops[a][i] * (1. - f) + stops[a + 1][i] * f).round() as u8);
+    format!("rgb({},{},{})", rgb[0], rgb[1], rgb[2])
+}
+fn time_altitude(v: &Viewer, param: usize) -> String {
+    let mut s = svg(620., 365.);
+    let selected = &v.data.profiles[v.time];
+    let bottom = selected.gates[v.lower].lower_km;
+    let top = selected.gates[v.upper].upper_km;
+    let start = v.data.profiles[0].start_unix;
+    let end = v.data.profiles.last().unwrap().end_unix;
+    let x = |t: f64| 60. + (t - start) / (end - start) * 470.;
+    let y = |h: f64| 290. - (h - bottom) / (top - bottom) * 250.;
+    let (min, max, ticks): (f64, f64, Vec<(f64, String)>) = match param {
+        0 => (
+            8.,
+            13.,
+            (8..=13).map(|i| (i as f64, format!("10^{i}"))).collect(),
+        ),
+        1 => (
+            0.,
+            4000.,
+            (0..=4)
+                .map(|i| ((i * 1000) as f64, (i * 1000).to_string()))
+                .collect(),
+        ),
+        2 => (
+            0.,
+            8000.,
+            (0..=4)
+                .map(|i| ((i * 2000) as f64, (i * 2000).to_string()))
+                .collect(),
+        ),
+        _ => (
+            -1000.,
+            1000.,
+            (-2..=2)
+                .map(|i| ((i * 500) as f64, (i * 500).to_string()))
+                .collect(),
+        ),
+    };
+    s.push_str(&format!("<defs><pattern id='fit-hatch-{param}' patternUnits='userSpaceOnUse' width='6' height='6'><path d='M0,6 L6,0' stroke='#e0e0e0' stroke-opacity='0.55' stroke-width='1'/></pattern></defs>"));
+    s.push_str("<rect x='60' y='40' width='470' height='250' fill='#10202a'/>");
+    for (ti, p) in v.data.profiles.iter().enumerate() {
+        for (gi, g) in p.gates.iter().enumerate().take(v.upper + 1).skip(v.lower) {
+            let Some(f) = &g.result else { continue };
+            if g.status == "singular" {
+                continue;
+            }
+            let raw = value(&f.plasma, param);
+            if !raw.is_finite() || (param == 0 && raw <= 0.) {
+                continue;
+            }
+            let z = if param == 0 { raw.log10() } else { raw };
+            let color = plasma_color((z - min) / (max - min));
+            let xx = x(p.start_unix);
+            let yy = y(g.upper_km);
+            let width = x(p.end_unix) - xx;
+            let height = y(g.lower_km) - yy;
+            let title = format!(
+                "{}–{} UTC; {:.0}–{:.0} km; {:.3e}; {}",
+                clock(p.start_unix),
+                clock(p.end_unix),
+                g.lower_km,
+                g.upper_km,
+                raw,
+                g.status
+            );
+            s.push_str(&format!("<rect class='fit-cell' data-time='{ti}' data-gate='{gi}' x='{xx:.2}' y='{yy:.2}' width='{width:.2}' height='{height:.2}' fill='{color}'><title>{title}</title></rect>"));
+            if g.status != "converged" {
+                s.push_str(&format!("<rect x='{xx:.2}' y='{yy:.2}' width='{width:.2}' height='{height:.2}' fill='url(#fit-hatch-{param})' pointer-events='none'/>"));
+            }
+        }
+    }
+    let gate = &selected.gates[v.gate];
+    s.push_str(&format!("<rect x='{:.2}' y='{:.2}' width='{:.2}' height='{:.2}' fill='none' stroke='white' stroke-width='1.5' pointer-events='none'/>",x(selected.start_unix),y(gate.upper_km),x(selected.end_unix)-x(selected.start_unix),y(gate.lower_km)-y(gate.upper_km)));
+    for h in altitude_ticks(bottom, top) {
+        label(&mut s, 52., y(h as f64) + 4., &h.to_string(), "end");
+    }
+    for i in 0..=3 {
+        let t = start + (end - start) * i as f64 / 3.;
+        label(&mut s, x(t), 310., &clock(t)[..5], "middle");
+    }
+    label(&mut s, 60., 24., "Altitude / km", "start");
+    label(&mut s, 295., 340., "Time / UTC", "middle");
+    for i in 0..100 {
+        s.push_str(&format!(
+            "<rect x='545' y='{:.2}' width='12' height='2.6' fill='{}'/>",
+            290. - (i + 1) as f64 * 2.5,
+            plasma_color(i as f64 / 99.)
+        ));
+    }
+    for (z, t) in ticks {
+        label(
+            &mut s,
+            562.,
+            290. - (z - min) / (max - min) * 250. + 4.,
+            &t,
+            "start",
+        );
+    }
+    s.push_str("</svg>");
+    s
+}
+
 fn acf(v: &Viewer, component: usize) -> String {
     let g = &v.data.profiles[v.time].gates[v.gate];
     let mut s = svg(620., 330.);
@@ -196,7 +334,11 @@ fn acf(v: &Viewer, component: usize) -> String {
         .iter()
         .zip(&g.sigma)
         .map(|(a, e)| a[component].abs() + e[component])
-        .chain(f.predicted.iter().map(|a| a[component].abs()))
+        .chain(
+            f.model_curve
+                .iter()
+                .map(|p| p.value[component].abs() + p.standard_error.map_or(0., |e| e[component])),
+        )
         .fold(1., f64::max);
     let scale = 10f64.powf(magnitude.log10().floor());
     let ymax = (magnitude / scale * 1.1).max(1.);
@@ -219,13 +361,31 @@ fn acf(v: &Viewer, component: usize) -> String {
         "start",
     );
     label(&mut s, 335., 315., "Measured lag / µs", "middle");
-    for (((&lag, obs), err), pred) in g
-        .lag_us
-        .iter()
-        .zip(&g.observed)
-        .zip(&g.sigma)
-        .zip(&f.predicted)
-    {
+    // Draw the band behind measurements, with straight segments only between
+    // supplied measured-lag predictions. Never fill an absent uncertainty.
+    for segment in f.model_curve.split(|p| p.standard_error.is_none()) {
+        if segment.len() < 2 {
+            continue;
+        }
+        let mut path = String::new();
+        for (i, p) in segment.iter().enumerate() {
+            path.push_str(&format!(
+                "{} {:.2},{:.2} ",
+                if i == 0 { "M" } else { "L" },
+                x(p.lag_s * 1e6),
+                y(p.value[component] + p.standard_error.unwrap()[component])
+            ));
+        }
+        for p in segment.iter().rev() {
+            path.push_str(&format!(
+                "L {:.2},{:.2} ",
+                x(p.lag_s * 1e6),
+                y(p.value[component] - p.standard_error.unwrap()[component])
+            ));
+        }
+        s.push_str(&format!("<path class='model-band' d='{path} Z' fill='#f7be45' fill-opacity='0.30' stroke='none'/>"));
+    }
+    for ((&lag, obs), err) in g.lag_us.iter().zip(&g.observed).zip(&g.sigma) {
         let xx = x(lag);
         line(
             &mut s,
@@ -239,17 +399,58 @@ fn acf(v: &Viewer, component: usize) -> String {
             "<circle cx='{xx:.2}' cy='{:.2}' r='2.4' fill='#96a9bb'/>",
             y(obs[component])
         ));
-        s.push_str(&format!(
-            "<circle cx='{xx:.2}' cy='{:.2}' r='2.5' fill='#f7be45'/>",
-            y(pred[component])
+    }
+    let mut path = String::new();
+    for (i, p) in f.model_curve.iter().enumerate() {
+        path.push_str(&format!(
+            "{} {:.2},{:.2} ",
+            if i == 0 { "M" } else { "L" },
+            x(p.lag_s * 1e6),
+            y(p.value[component])
         ));
     }
+    s.push_str(&format!(
+        "<path class='model-line' d='{path}' fill='none' stroke='#f7be45' stroke-width='2'/>"
+    ));
     s.push_str("</svg>");
     s
 }
 fn render(v: &Viewer) {
     let p = &v.data.profiles[v.time];
     let g = &p.gates[v.gate];
+    let altitude_slider: HtmlInputElement = el("fit-altitude").dyn_into().unwrap();
+    altitude_slider.set_min(&v.lower.to_string());
+    altitude_slider.set_max(&v.upper.to_string());
+    altitude_slider.set_value(&v.gate.to_string());
+    altitude_slider
+        .set_attribute(
+            "aria-valuetext",
+            &format!("{:.0}–{:.0} km", g.lower_km, g.upper_km),
+        )
+        .unwrap();
+    let selector: HtmlSelectElement = el("fit-gate").dyn_into().unwrap();
+    selector.set_value(&v.gate.to_string());
+    text(
+        "fit-altitude-label",
+        &format!("Selected altitude: {:.0}–{:.0} km", g.lower_km, g.upper_km),
+    );
+    text(
+        "fit-range-label",
+        &format!(
+            "Displayed altitude: {:.0}–{:.0} km",
+            p.gates[v.lower].lower_km, p.gates[v.upper].upper_km
+        ),
+    );
+    for (id, index, altitude) in [
+        ("fit-altitude-min", v.lower, p.gates[v.lower].lower_km),
+        ("fit-altitude-max", v.upper, p.gates[v.upper].upper_km),
+    ] {
+        let slider: HtmlInputElement = el(id).dyn_into().unwrap();
+        slider.set_value(&index.to_string());
+        slider
+            .set_attribute("aria-valuetext", &format!("{altitude:.0} km"))
+            .unwrap();
+    }
     text(
         "fit-time",
         &format!(
@@ -269,6 +470,7 @@ fn render(v: &Viewer) {
     );
     for i in 0..4 {
         el(&format!("fit-profile-{i}")).set_inner_html(&profile(v, i));
+        el(&format!("fit-map-{i}")).set_inner_html(&time_altitude(v, i));
     }
     for i in 0..2 {
         el(&format!("fit-acf-{i}")).set_inner_html(&acf(v, i));
@@ -346,27 +548,43 @@ pub async fn start_ion() -> Result<(), JsValue> {
     let time = 5.min(data.profiles.len() - 1);
     let selector: HtmlSelectElement = el("fit-gate").dyn_into()?;
     selector.set_value(&gate.to_string());
-    let state = Rc::new(RefCell::new(Viewer { data, time, gate }));
+    let upper = data.profiles[0].gates.len() - 1;
+    for id in ["fit-altitude", "fit-altitude-min", "fit-altitude-max"] {
+        let slider: HtmlInputElement = el(id).dyn_into()?;
+        slider.set_max(&upper.to_string());
+    }
+    let state = Rc::new(RefCell::new(Viewer {
+        data,
+        time,
+        gate,
+        lower: 0,
+        upper,
+    }));
     render(&state.borrow());
-    for (id, event, is_time) in [("fit-slider", "input", true), ("fit-gate", "change", false)] {
+    for (id, event) in [
+        ("fit-slider", "input"),
+        ("fit-gate", "change"),
+        ("fit-altitude", "input"),
+        ("fit-altitude-min", "input"),
+        ("fit-altitude-max", "input"),
+    ] {
         let state = state.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
             let mut s = state.borrow_mut();
-            if is_time {
-                let input: HtmlInputElement = el("fit-slider").dyn_into().unwrap();
-                s.time = input
-                    .value()
-                    .parse::<usize>()
-                    .unwrap_or(0)
-                    .min(s.data.profiles.len() - 1);
+            let raw = if id == "fit-gate" {
+                el(id).dyn_into::<HtmlSelectElement>().unwrap().value()
             } else {
-                let select: HtmlSelectElement = el("fit-gate").dyn_into().unwrap();
-                s.gate = select
-                    .value()
-                    .parse::<usize>()
-                    .unwrap_or(0)
-                    .min(s.data.profiles[s.time].gates.len() - 1);
+                el(id).dyn_into::<HtmlInputElement>().unwrap().value()
+            };
+            let index = raw.parse::<usize>().unwrap_or(0);
+            let last = s.data.profiles[s.time].gates.len() - 1;
+            match id {
+                "fit-slider" => s.time = index.min(s.data.profiles.len() - 1),
+                "fit-altitude-min" => s.lower = index.min(s.upper),
+                "fit-altitude-max" => s.upper = index.max(s.lower).min(last),
+                _ => s.gate = index.min(last),
             }
+            s.gate = s.gate.clamp(s.lower, s.upper);
             render(&s);
         });
         el(id).add_event_listener_with_callback(event, cb.as_ref().unchecked_ref())?;

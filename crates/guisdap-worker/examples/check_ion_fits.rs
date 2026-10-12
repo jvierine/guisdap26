@@ -9,6 +9,28 @@ fn main() -> Result<()> {
             .read_raw::<u8>()?,
     )?;
     let profiles = data["profiles"].as_array().unwrap();
+    if let Some(previous) = std::env::args().nth(2) {
+        let old: Value = serde_json::from_slice(&std::fs::read(previous)?)?;
+        ensure!(
+            old["profiles"].as_array().unwrap().len() == profiles.len(),
+            "profile count changed"
+        );
+        for (p, oldp) in profiles.iter().zip(old["profiles"].as_array().unwrap()) {
+            for (g, oldg) in p["gates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(oldp["gates"].as_array().unwrap())
+            {
+                let mut current = g["result"].clone();
+                if let Some(r) = current.as_object_mut() {
+                    r.remove("model_curve");
+                }
+                ensure!(current == oldg["result"], "existing fit result changed");
+            }
+        }
+        println!("PASS existing fit results unchanged");
+    }
     let mut counts = BTreeMap::new();
     for (i, p) in profiles.iter().enumerate() {
         let gates = p["gates"].as_array().unwrap();
@@ -26,6 +48,31 @@ fn main() -> Result<()> {
                     r["predicted"].as_array().unwrap().len() == n,
                     "prediction count"
                 );
+                let curve = r["model_curve"].as_array().unwrap();
+                let ds = h.dataset(&format!("profile_{i:03}/gate_{j:03}/model_curve"))?;
+                ensure!(ds.shape() == [curve.len(), 5], "model curve shape");
+                let stored = ds.read_raw::<f64>()?;
+                for (row, point) in stored.as_chunks::<5>().0.iter().zip(curve) {
+                    let expected = [
+                        point["lag_s"].as_f64().unwrap(),
+                        point["value"][0].as_f64().unwrap(),
+                        point["value"][1].as_f64().unwrap(),
+                        point["standard_error"][0].as_f64().unwrap_or(f64::NAN),
+                        point["standard_error"][1].as_f64().unwrap_or(f64::NAN),
+                    ];
+                    for (&a, b) in row.iter().zip(expected) {
+                        ensure!(
+                            (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-12 * b.abs().max(1.),
+                            "model curve HDF5/JSON disagreement"
+                        );
+                    }
+                    ensure!(
+                        row[3..]
+                            .iter()
+                            .all(|e| e.is_nan() || (e.is_finite() && *e >= 0.)),
+                        "invalid model error"
+                    );
+                }
                 let ne = r["plasma"]["electron_density_m3"].as_f64().unwrap();
                 ensure!((values[j * 5] - ne).abs() < 1., "HDF5/JSON disagreement");
             }

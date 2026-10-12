@@ -237,3 +237,21 @@ See [ion-fitting.md](ion-fitting.md) for the physical model, calibration,
 composition/collision assumptions, optimizer, uncertainty calculation, and limits.
 The current plasma-line frequency labels also remain provisional: the recorded
 ELAN oscillator selections and its user-parameter offset calculation disagree.
+
+
+### Recovered BEATA plasma-line reference
+
+User-supplied `beatapl.py` from https://github.com/jvierine/ipypl targets
+BEATA 2.0. Its zero-based plasma read offset is `36611 + 82232 * channel`,
+with 800 lags × 90 ranges in lag-major order (reshape 800 × 90, transpose).
+It uses 2.5 MHz lag sampling, `d_parbl[0,46+channel]` for centre frequency,
+and a hard-coded 107.25 km first range with 3 km spacing. It applies a
+sqrt(sample-count) lag window, a Hermitian FFT, absolute value, frequency
+smoothing and per-frequency median normalization. These are useful reference
+clues, not validation of the 2022 BEATA 2.2 layout. The absolute-value display
+is biased and must not replace signed spectral estimates; neither its hard-coded
+range origin nor its addresses are adopted without matching the run definitions.
+The reference's long-lag offset and 82,232-word channel stride agree with
+`native_long` extraction in the current Rust reader. This narrows further
+comparison to lag origin, weighting/FFT conventions and frequency/range metadata;
+it is not evidence for changing the current read address.

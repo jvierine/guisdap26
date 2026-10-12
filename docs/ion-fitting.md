@@ -136,3 +136,23 @@ inspection example checks native arrays against the serialized diagnostics.
 These tests validate numerical implementation; they do not replace an independent
 full GUISDAP comparison or establish the composition and low-altitude collision
 model for this event. The plasma-line tuning ambiguity is separate and unresolved.
+
+
+The gold lag-model line averages predicted responses over the groups at each
+measured lag. Individual measured groups remain visible and enter the fit
+separately. Its 30% opacity band shows pointwise ±1σ uncertainty of that fitted
+mean. The response Jacobians are averaged before applying the full fitted
+parameter covariance (`g C gᵀ`), including off-diagonal terms and tied-temperature
+constraints. Predictions sharing fitted parameters are not independent samples.
+This linearized band excludes measurement noise and fixed composition/calibration
+uncertainty; boundary and unconverged fits remain provisional. Unavailable
+covariance produces a line without a band. The display does not create lag data
+or affect the fit. HDF5 `gate_NNN/model_curve` stores lag seconds, real/imaginary
+means and their standard errors; unavailable errors are NaN (null in JSON).
+
+
+The ion GUI includes time–altitude colour meshes of Ne, Ti, Te and spectral
+velocity with fixed colour limits and logarithmic Ne. Flagged fits are hatched;
+singular/missing fits are blank. Separate controls choose the diagnostic altitude
+and the lower/upper displayed altitude bounds. Display limits never filter or
+refit the stored measurements.

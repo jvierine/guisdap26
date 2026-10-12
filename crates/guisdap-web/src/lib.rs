@@ -77,9 +77,17 @@ fn report(e: JsValue) {
     web_sys::console::error_1(&e);
 }
 async fn response(url: &str) -> Result<web_sys::Response, JsValue> {
-    let r: web_sys::Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(url))
-        .await?
-        .dyn_into()?;
+    let request = web_sys::RequestInit::new();
+    if url.ends_with("config.json") {
+        request.set_cache(web_sys::RequestCache::NoCache);
+    }
+    let r: web_sys::Response = JsFuture::from(
+        web_sys::window()
+            .unwrap()
+            .fetch_with_str_and_init(url, &request),
+    )
+    .await?
+    .dyn_into()?;
     if !r.ok() {
         return Err(error(format!("HTTP {}: {url}", r.status())));
     }

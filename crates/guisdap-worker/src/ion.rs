@@ -388,6 +388,7 @@ fn fit_gate(records: &[Record], exp: &Experiment, cfg: &Config, lo: f64, hi: f64
         .min_by(|a, b| a.chi_square.total_cmp(&b.chi_square))
     {
         problem.temporal_uncertainty(&mut best, &samples)?;
+        problem.model_uncertainty(&mut best)?;
         if best.status == "converged" && gate.first_lag_signal_to_noise.is_none_or(|s| s < 3.) {
             best.status = "weak_signal".into();
         }
@@ -568,6 +569,20 @@ pub fn run(path: &Path) -> Result<()> {
                 if let Some(r) = &g.result {
                     arrays.push(("predicted", r.predicted.clone()));
                     arrays.push(("standardized_residual", r.standardized_residual.clone()));
+                    let curve: Vec<f64> = r
+                        .model_curve
+                        .iter()
+                        .flat_map(|p| {
+                            let e = p.standard_error.unwrap_or([f64::NAN; 2]);
+                            [p.lag_s, p.value[0], p.value[1], e[0], e[1]]
+                        })
+                        .collect();
+                    let ds = gg
+                        .new_dataset::<f64>()
+                        .shape([r.model_curve.len(), 5])
+                        .create("model_curve")?;
+                    ds.write_raw(&curve)?;
+                    ds.new_attr_builder().with_data("lag_s,mean_real,mean_imag,sigma_real,sigma_imag; s,m^-3,m^-3,m^-3,m^-3").create("columns")?;
                     let n = r.free_parameter_indices.len();
                     if r.covariance.len() == n * n {
                         let ds = gg

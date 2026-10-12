@@ -177,3 +177,95 @@ fn negative_echo_is_preserved_and_does_not_become_a_successful_density_fit() {
     assert_ne!(fit.status, "converged");
     assert_eq!(p.measurements[0].value, stored);
 }
+
+#[test]
+fn model_band_propagates_correlations_ties_and_shared_response_averages() {
+    for tied in [false, true] {
+        let truth = PlasmaState {
+            electron_density_m3: 3e11,
+            ion_temperature_k: 900.,
+            electron_temperature_k: if tied { 900. } else { 1900. },
+            velocity_m_s: -230.,
+            ion_collision_s: 500.,
+        };
+        let mut p = problem(truth, true);
+        p.settings.tie_electron_ion_temperature = tied;
+        let mut fit = p.solve(truth).unwrap();
+        // Perfectly correlated physical perturbation. The prediction variance
+        // must equal the square of an independent directional derivative.
+        let direction = [3e9, 20., if tied { 20. } else { 35. }, 5., 50.];
+        fit.covariance = fit
+            .free_parameter_indices
+            .iter()
+            .flat_map(|&i| {
+                fit.free_parameter_indices
+                    .iter()
+                    .map(move |&j| direction[i] * direction[j])
+            })
+            .collect();
+        let mut extra = p.measurements.clone();
+        for m in &mut extra {
+            for k in &mut m.kernel {
+                *k *= 2.;
+            }
+        }
+        p.measurements.extend(extra);
+        p.measurements.reverse(); // Output must be ordered by lag, not raw address.
+        p.model_uncertainty(&mut fit).unwrap();
+        let eps = 1e-3;
+        let perturb = |sign: f64| PlasmaState {
+            electron_density_m3: truth.electron_density_m3 + sign * eps * direction[0],
+            ion_temperature_k: truth.ion_temperature_k + sign * eps * direction[1],
+            electron_temperature_k: truth.electron_temperature_k + sign * eps * direction[2],
+            velocity_m_s: truth.velocity_m_s + sign * eps * direction[3],
+            ion_collision_s: truth.ion_collision_s + sign * eps * direction[4],
+        };
+        let plus = p.predict(perturb(1.)).unwrap();
+        let minus = p.predict(perturb(-1.)).unwrap();
+        let nominal = p.predict(truth).unwrap();
+        assert_eq!(fit.model_curve.len(), 41);
+        assert!(fit.model_curve.windows(2).all(|w| w[0].lag_s < w[1].lag_s));
+        for point in &fit.model_curve {
+            let rows: Vec<_> = p
+                .measurements
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.lag_s == point.lag_s)
+                .map(|(i, _)| i)
+                .collect();
+            let derivative: C = rows
+                .iter()
+                .map(|&i| (plus[i] - minus[i]) / (2. * eps))
+                .sum::<C>()
+                / rows.len() as f64;
+            let mean: C = rows.iter().map(|&i| nominal[i]).sum::<C>() / rows.len() as f64;
+            let errors = point.standard_error.unwrap();
+            for (actual, expected) in errors
+                .into_iter()
+                .zip([derivative.re.abs(), derivative.im.abs()])
+            {
+                assert!(
+                    (actual - expected).abs() < 1e-4 * expected.max(1.),
+                    "{actual} vs {expected}"
+                );
+            }
+            assert!((point.value[0] - mean.re).abs() < 1e-3);
+        }
+        let previous = fit.model_curve.clone();
+        p.measurements.extend(p.measurements.clone());
+        p.model_uncertainty(&mut fit).unwrap();
+        for (a, b) in previous.iter().zip(&fit.model_curve) {
+            for (ea, eb) in a
+                .standard_error
+                .unwrap()
+                .into_iter()
+                .zip(b.standard_error.unwrap())
+            {
+                assert!((ea - eb).abs() < 1e-5 * ea.max(1.));
+            }
+        }
+        fit.covariance.clear();
+        p.model_uncertainty(&mut fit).unwrap();
+        assert!(fit.model_curve.iter().all(|p| p.standard_error.is_none()));
+    }
+}

@@ -32,6 +32,14 @@ impl Default for FitSettings {
         }
     }
 }
+/// Display prediction averaged over response groups at the same measured lag.
+/// Errors are pointwise standard errors of the fitted mean, not measurement noise.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelPoint {
+    pub lag_s: f64,
+    pub value: [f64; 2],
+    pub standard_error: Option<[f64; 2]>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitResult {
     pub plasma: PlasmaState,
@@ -47,6 +55,8 @@ pub struct FitResult {
     pub iterations: usize,
     pub status: String,
     pub predicted: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub model_curve: Vec<ModelPoint>,
     pub standardized_residual: Vec<[f64; 2]>,
 }
 #[derive(Clone, Debug)]
@@ -279,6 +289,7 @@ impl FitProblem {
             iterations,
             status: status.into(),
             predicted,
+            model_curve: vec![],
             standardized_residual: residual,
         })
     }
@@ -366,6 +377,109 @@ impl FitProblem {
                 .any(|&i| result.standard_error[i].is_none_or(|e| !e.is_finite() || e > values[i]))
         {
             result.status = "low_information".into();
+        }
+        Ok(())
+    }
+}
+
+impl FitProblem {
+    /// Build a line on measured lags only. Average the response gradients before
+    /// propagating covariance: repeated responses share fitted parameters and
+    /// must not be treated as independent predictions. Call after covariance updates.
+    pub fn model_uncertainty(&self, result: &mut FitResult) -> Result<()> {
+        let ind = self.indices();
+        ensure!(
+            result.free_parameter_indices == ind,
+            "fit parameter mismatch"
+        );
+        ensure!(
+            self.measurements.iter().all(|m| m.lag_s.is_finite()),
+            "invalid lag"
+        );
+        let p = result.plasma;
+        let values = [
+            p.electron_density_m3,
+            p.ion_temperature_k,
+            p.electron_temperature_k,
+            p.velocity_m_s,
+            p.ion_collision_s,
+        ];
+        let scales = [values[0], values[1], values[2], 1000., values[4]];
+        let x = DVector::from_iterator(
+            ind.len(),
+            ind.iter().map(|&i| match i {
+                0 => (values[i] / 1e11).ln(),
+                1 | 2 | 4 => (values[i] / 1000.).ln(),
+                3 => values[i] / 1000.,
+                _ => unreachable!(),
+            }),
+        );
+        let pred = self.predict(p)?;
+        let cov = if result.covariance.len() == ind.len() * ind.len()
+            && result.covariance.iter().all(|v| v.is_finite())
+        {
+            Some(DMatrix::from_fn(ind.len(), ind.len(), |a, b| {
+                result.covariance[a * ind.len() + b] / scales[ind[a]] / scales[ind[b]]
+            }))
+        } else {
+            None
+        };
+        // Differentiate predictions directly; no subtraction of noisy observations.
+        // state() applies tied-temperature constraints to every perturbation.
+        let mut derivatives = Vec::new();
+        if cov.is_some() {
+            for i in 0..ind.len() {
+                let mut a = x.clone();
+                let mut b = x.clone();
+                a[i] += 1e-4;
+                b[i] -= 1e-4;
+                derivatives.push(
+                    self.predict(self.state(&a, &ind))?
+                        .iter()
+                        .zip(self.predict(self.state(&b, &ind))?)
+                        .map(|(a, b)| (*a - b) / 2e-4)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let mut order: Vec<_> = (0..self.measurements.len()).collect();
+        order.sort_by(|&a, &b| {
+            self.measurements[a]
+                .lag_s
+                .total_cmp(&self.measurements[b].lag_s)
+        });
+        result.model_curve.clear();
+        for rows in
+            order.chunk_by(|&a, &b| self.measurements[a].lag_s == self.measurements[b].lag_s)
+        {
+            let mean: C = rows.iter().map(|&i| pred[i]).sum::<C>() / rows.len() as f64;
+            let error = cov.as_ref().and_then(|cov| {
+                let mut errors = [0.; 2];
+                for (component, error) in errors.iter_mut().enumerate() {
+                    let gradient = DVector::from_iterator(
+                        ind.len(),
+                        derivatives.iter().map(|d| {
+                            let mean: C = rows.iter().map(|&i| d[i]).sum::<C>() / rows.len() as f64;
+                            if component == 0 {
+                                mean.re
+                            } else {
+                                mean.im
+                            }
+                        }),
+                    );
+                    let variance = gradient.dot(&(cov * &gradient));
+                    if !variance.is_finite() || variance < 0. {
+                        return None;
+                    }
+                    *error = variance.sqrt();
+                }
+                Some(errors)
+            });
+            result.model_curve.push(ModelPoint {
+                lag_s: self.measurements[rows[0]].lag_s,
+                value: [mean.re, mean.im],
+                standard_error: error,
+            });
         }
         Ok(())
     }
