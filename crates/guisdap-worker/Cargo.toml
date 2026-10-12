@@ -1,0 +1,21 @@
+[package]
+name = "guisdap-worker"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+guisdap-core.workspace = true
+bzip2 = "0.5"
+byteorder = "1"
+hdf5 = { package = "hdf5-metno", version = "0.12" }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+sha2 = "0.10"
+walkdir = "2"
+tempfile = "3"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

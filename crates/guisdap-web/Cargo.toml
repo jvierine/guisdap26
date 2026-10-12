@@ -1,0 +1,14 @@
+[package]
+name = "guisdap-web"
+version.workspace = true
+edition.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+guisdap-core = { path = "../guisdap-core" }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCollection", "Element", "HtmlElement", "HtmlInputElement", "HtmlSelectElement", "HtmlCanvasElement", "Event", "EventTarget", "Response", "WebGl2RenderingContext", "WebGlProgram", "WebGlShader", "WebGlTexture", "WebGlBuffer", "WebGlUniformLocation", "console"] }

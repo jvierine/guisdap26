@@ -1,0 +1,12 @@
+[Unit]
+Description=GUISDAP26 static visualization service
+After=network.target
+
+[Service]
+WorkingDirectory=%h/src/guisdap26
+ExecStart=%h/src/guisdap26/target/release/guisdap-worker serve --root %h/src/guisdap26/web --bind 0.0.0.0:8088
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

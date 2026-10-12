@@ -1,0 +1,13 @@
+/legacy/
+/local/
+/target/
+/data/
+/products/
+/web/pkg/
+/web/data/
+*.h5
+*.hdf5
+*.mat
+*.bz2
+*.pdf
+*.tar

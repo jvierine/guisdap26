@@ -1,0 +1,7 @@
+{
+  "roots": ["/urdr/data/beata", "/mnt/data/oliver/02112022"],
+  "output": "/mnt/shovel/guisdap/2022-11-02",
+  "start": "2022-11-02T17:00:00Z",
+  "end": "2022-11-02T17:15:00Z",
+  "threads": 8
+}
