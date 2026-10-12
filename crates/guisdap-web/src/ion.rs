@@ -1,6 +1,7 @@
 //! Ion-fit inspection. All interaction and plotting run in Rust/WASM.
 mod colors;
 mod instruments;
+mod measured;
 mod raster;
 use super::{el, error, json, text};
 use serde::Deserialize;
@@ -74,6 +75,8 @@ struct Settings {
 }
 #[derive(Clone, Deserialize)]
 struct Fit {
+    #[serde(default)]
+    predicted: Vec<[f64; 2]>,
     #[serde(default)]
     covariance: Vec<f64>,
     #[serde(default)]
@@ -726,6 +729,7 @@ fn render(v: &Viewer) {
         el(&format!("fit-acf-{i}")).set_inner_html(&acf(v, i));
     }
     el("fit-spectrum").set_inner_html(&analytical_spectrum(v));
+    el("fit-measured-spectrum").set_inner_html(&measured::spectrum(v));
     text(
         "fit-gate-model",
         &format!(

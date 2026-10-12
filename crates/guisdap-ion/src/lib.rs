@@ -1,4 +1,5 @@
 //! Ion-line physics and inference. All state is supplied explicitly; no I/O or globals.
+pub mod dft;
 pub mod fit;
 pub mod noise;
 pub mod spectrum;
