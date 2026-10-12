@@ -1015,8 +1015,8 @@ pub async fn start_ion() -> Result<(), JsValue> {
         ],
         quality_limit: 10.,
         quality: guisdap_core::quality::Limits::default(),
-        mask_bad: true,
-        hatch_bad: true,
+        mask_bad: false,
+        hatch_bad: false,
     }));
     render(&state.borrow());
     status_view(&state.borrow());
