@@ -70,16 +70,18 @@ outstanding. Existing signed raw-power products are preserved.
 ## Explicit first-pass assumptions
 
 The ion mixture is O+ (16 amu) and an effective molecular species (30.5 amu).
-The oxygen fraction is fixed to `1/(1+exp(-(h-180)/20))`, with altitude in km.
-This is a configurable starting composition assumption, not a composition
-measurement or an IRI calculation. Composition uncertainty is not in the bars.
+The molecular fraction comes from the Rust implementation of IRI's DS-1995 option.
+The remainder is represented as O+. MSIS neutral densities prescribe a common
+effective ion-neutral collision rate for both species; collision frequency is
+not an optimizer parameter. Below 120 km Te remains tied to Ti. Electron collision
+frequency remains zero. Model uncertainty is not included in the conditional fit
+error bars. The climatological composition does not solve auroral chemistry.
+See [prescribed atmosphere](prescribed-atmosphere.md) for the exact model versions,
+solar-input conventions, rate coefficients, domain limits and reference tests.
 
-Below 120 km, Te is tied to Ti. Below 150 km, the effective ion BGK rate is fitted;
-above that altitude it is fixed to zero. The electron collision rate is zero.
-The low-altitude model is a first approximation, not a validated full magnetized,
-ion-neutral collision calculation. Changing those assumptions can change the
-inferred temperatures and density. The lowest bins often cannot identify all
-parameters and must be judged from their flags and residuals.
+The earlier v2/v3 products used a logistic oxygen fraction and fitted a collision
+rate below 150 km. They are retained as historical products; the current model
+refits use the `msis-iri-v5` suffix and are published separately.
 
 The velocity convention is positive model spectral frequency shift. Physical
 toward/away sign remains to be verified from receiver conventions. It is labelled
@@ -323,7 +325,7 @@ its `gain` field is C. Existing relative quantities remain provenance fields.
 Ion datasets expose the constant actually used and antenna efficiency in
 `calibration` metadata, separately from estimates that have not been applied.
 
-### Hardened production refit (v3)
+### Historical optimizer-only refit (v3; superseded by MSIS/IRI v5)
 Coarse range gates are refitted first (60 s, then 15 s), followed by native
 range gates (60 s, then 15 s), with 128 Rayon workers per dataset. Original
 products remain available. Publication requires matching time/range grids,
@@ -346,3 +348,17 @@ disabled. The existing temporal-cluster uncertainty remains in production; the
 separate full-covariance/two-pass API is not yet a BEATA self-noise implementation.
 The native range selection uses physical slant-range cell boundaries before
 mapping to altitude, retaining exactly one native range cell below 250 km.
+
+### Prescribed MSIS/IRI refit (v5)
+
+The v3 optimizer safeguards remain. The collision and composition assumptions are
+replaced as described in [prescribed atmosphere](prescribed-atmosphere.md).
+All four cadence/range combinations run with 128 workers, coarse gates first.
+Validation preserves time/range grids and measurement counts while accounting
+for removal of the free collision parameter. A changed physical model can have
+higher chi-square than its less constrained predecessor; no non-worsening claim
+is made across the two models.
+
+The fit inspector renders an intrinsic analytical ISR spectrum beside the two
+response-convolved ACF components. The real and imaginary panels share a vertical
+scale computed from both components, measurement errors and model bands.

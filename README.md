@@ -6,8 +6,9 @@ The first vertical slice processes Tromsø UHF **BEATA 2.2, 2022-11-02,
 
 This is a research quick-look implementation, not yet a replacement for full
 GUISDAP inference. It displays signed 10 µs lag raw-Ne equivalents down to about 47.5 km, with approximate statistical error bars;
-A separate Rust ion-line fitter now estimates density, temperatures, spectral velocity,
-and an effective collision rate, with explicit composition assumptions and fit flags.
+The Rust ion-line fitter estimates density, temperatures and spectral velocity, with
+prescribed Rust MSIS collision rates and IRI DS-1995 molecular fractions. Collision
+frequency is not fitted. See [model provenance and limits](docs/prescribed-atmosphere.md).
 See [ion fitting](docs/ion-fitting.md) and the live [fit inspector](http://avaruus.uit.no/guisdap/ion.html).
 The equations, range responses and limitations are in [docs/science.md](docs/science.md).
 
