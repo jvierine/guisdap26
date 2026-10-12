@@ -60,3 +60,9 @@ Export into a staging day directory and switch it into place after completion.
 Within an export the JSON index is written last. Existing date exports should not
 be rewritten while clients are reading them; publish a new versioned directory
 when reprocessing, then change `config.json` atomically.
+
+The ion-fit inspector is `ion.html`, linked from the main viewer. Its static
+product URL is configured independently in `ion-config.json`. Copy the JSON
+products and this configuration to the thin host along with the same WASM assets.
+No raw input, experiment-definition MAT file, HDF5 reader, or backend is required
+by the browser. Internal ion-fit HDF5 products remain on the compute/data host.

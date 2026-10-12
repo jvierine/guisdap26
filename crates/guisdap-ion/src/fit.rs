@@ -1,0 +1,372 @@
+//! Bounded Levenberg–Marquardt in physical parameter transforms. No SVD or lag filling.
+use crate::{
+    spectrum::{PlasmaState, SpectrumModel},
+    Complex as C,
+};
+use anyhow::{ensure, Result};
+use nalgebra::{DMatrix, DVector};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug)]
+pub struct Measurement {
+    pub lag_s: f64,
+    pub value: C,
+    pub sigma: [f64; 2],
+    /// Frequency response including quadrature weights, in Hz. No assumed ideal lag.
+    pub kernel: Vec<C>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FitSettings {
+    pub tie_electron_ion_temperature: bool,
+    pub fit_collision_rate: bool,
+    pub fixed_collision_s: f64,
+    pub max_iterations: usize,
+}
+impl Default for FitSettings {
+    fn default() -> Self {
+        Self {
+            tie_electron_ion_temperature: false,
+            fit_collision_rate: false,
+            fixed_collision_s: 0.,
+            max_iterations: 80,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FitResult {
+    pub plasma: PlasmaState,
+    /// Parameter order: Ne, Ti, Te, signed spectral velocity, collision rate.
+    /// None for fixed, unidentified, or singular errors; tied Te copies Ti error.
+    pub standard_error: [Option<f64>; 5],
+    pub conditional_standard_error: [Option<f64>; 5],
+    pub covariance: Vec<f64>,
+    pub free_parameter_indices: Vec<usize>,
+    pub chi_square: f64,
+    pub degrees_of_freedom: usize,
+    pub reduced_chi_square: f64,
+    pub iterations: usize,
+    pub status: String,
+    pub predicted: Vec<[f64; 2]>,
+    pub standardized_residual: Vec<[f64; 2]>,
+}
+#[derive(Clone, Debug)]
+pub struct FitProblem {
+    pub model: SpectrumModel,
+    pub frequency_hz: Vec<f64>,
+    pub measurements: Vec<Measurement>,
+    pub settings: FitSettings,
+}
+impl FitProblem {
+    pub fn predict(&self, p: PlasmaState) -> Result<Vec<C>> {
+        let s = self.model.evaluate(p, &self.frequency_hz)?;
+        Ok(self
+            .measurements
+            .iter()
+            .map(|m| {
+                m.kernel
+                    .iter()
+                    .zip(&s)
+                    .map(|(k, s)| *k * (*s * p.electron_density_m3))
+                    .sum()
+            })
+            .collect())
+    }
+    fn indices(&self) -> Vec<usize> {
+        let mut v = vec![0, 1];
+        if !self.settings.tie_electron_ion_temperature {
+            v.push(2);
+        }
+        v.push(3);
+        if self.settings.fit_collision_rate {
+            v.push(4);
+        }
+        v
+    }
+    fn state(&self, x: &DVector<f64>, indices: &[usize]) -> PlasmaState {
+        let mut p = [1e11, 1000., 1000., 0., self.settings.fixed_collision_s];
+        for (&i, &x) in indices.iter().zip(x.iter()) {
+            p[i] = match i {
+                0 => 1e11 * x.exp(),
+                1 | 2 => 1000. * x.exp(),
+                3 => 1000. * x,
+                4 => 1000. * x.exp(),
+                _ => unreachable!(),
+            };
+        }
+        if self.settings.tie_electron_ion_temperature {
+            p[2] = p[1];
+        }
+        PlasmaState {
+            electron_density_m3: p[0],
+            ion_temperature_k: p[1],
+            electron_temperature_k: p[2],
+            velocity_m_s: p[3],
+            ion_collision_s: p[4],
+        }
+    }
+    fn residual(&self, x: &DVector<f64>, indices: &[usize]) -> Result<DVector<f64>> {
+        let pred = self.predict(self.state(x, indices))?;
+        Ok(DVector::from_iterator(
+            2 * pred.len(),
+            self.measurements.iter().zip(pred).flat_map(|(m, p)| {
+                [
+                    (p.re - m.value.re) / m.sigma[0],
+                    (p.im - m.value.im) / m.sigma[1],
+                ]
+            }),
+        ))
+    }
+    fn jacobian(&self, x: &DVector<f64>, ind: &[usize]) -> Result<DMatrix<f64>> {
+        let mut j = DMatrix::zeros(self.measurements.len() * 2, ind.len());
+        for i in 0..ind.len() {
+            let mut a = x.clone();
+            let mut b = x.clone();
+            a[i] += 1e-4;
+            b[i] -= 1e-4;
+            j.set_column(
+                i,
+                &((self.residual(&a, ind)? - self.residual(&b, ind)?) / 2e-4),
+            );
+        }
+        Ok(j)
+    }
+    pub fn solve(&self, initial: PlasmaState) -> Result<FitResult> {
+        self.model.validate()?;
+        ensure!(
+            self.frequency_hz.len() >= 3 && self.frequency_hz.windows(2).all(|a| a[1] > a[0]),
+            "invalid model grid"
+        );
+        ensure!(
+            self.measurements
+                .iter()
+                .all(|m| m.kernel.len() == self.frequency_hz.len()
+                    && m.kernel
+                        .iter()
+                        .all(|k| k.re.is_finite() && k.im.is_finite())
+                    && m.value.re.is_finite()
+                    && m.value.im.is_finite()
+                    && m.sigma.iter().all(|s| s.is_finite() && *s > 0.)),
+            "invalid measurements"
+        );
+        let ind = self.indices();
+        let n = ind.len();
+        ensure!(self.measurements.len() * 2 > n, "insufficient measurements");
+        let p = [
+            initial.electron_density_m3,
+            initial.ion_temperature_k,
+            initial.electron_temperature_k,
+            initial.velocity_m_s,
+            initial.ion_collision_s,
+        ];
+        let mut x = DVector::from_iterator(
+            n,
+            ind.iter().map(|&i| match i {
+                0 => (p[i] / 1e11).ln(),
+                1 | 2 => (p[i] / 1000.).ln(),
+                3 => p[i] / 1000.,
+                4 => (p[i].max(1.) / 1000.).ln(),
+                _ => unreachable!(),
+            }),
+        );
+        let bounds = [
+            ((1e7f64 / 1e11).ln(), (1e14f64 / 1e11).ln()),
+            ((80f64 / 1000.).ln(), (10000f64 / 1000.).ln()),
+            ((80f64 / 1000.).ln(), (20000f64 / 1000.).ln()),
+            (-3., 3.),
+            ((0.1f64 / 1000.).ln(), (1e6f64 / 1000.).ln()),
+        ];
+        for (j, &i) in ind.iter().enumerate() {
+            x[j] = x[j].clamp(bounds[i].0, bounds[i].1);
+        }
+        let mut r = self.residual(&x, &ind)?;
+        let mut cost = r.norm_squared();
+        let mut damping = 1e-3;
+        let mut converged = false;
+        let mut iterations = 0;
+        for iteration in 0..self.settings.max_iterations {
+            iterations = iteration + 1;
+            let j = self.jacobian(&x, &ind)?;
+            let h = j.transpose() * &j;
+            let g = j.transpose() * &r;
+            if g.amax() < 1e-7 {
+                converged = true;
+                break;
+            }
+            let mut damped = h.clone();
+            for k in 0..n {
+                damped[(k, k)] += damping * h[(k, k)].max(1e-12);
+            }
+            let Some(chol) = damped.cholesky() else {
+                damping *= 10.;
+                continue;
+            };
+            let step = chol.solve(&(-g));
+            let mut candidate = &x + &step;
+            for (k, &i) in ind.iter().enumerate() {
+                candidate[k] = candidate[k].clamp(bounds[i].0, bounds[i].1);
+            }
+            let next = self.residual(&candidate, &ind)?;
+            let nextcost = next.norm_squared();
+            if nextcost < cost {
+                let change = cost - nextcost;
+                let effective = (&candidate - &x).norm();
+                x = candidate;
+                r = next;
+                cost = nextcost;
+                damping = (damping / 3.).max(1e-12);
+                if change < 1e-7 * (1. + cost) && effective < 1e-4 {
+                    converged = true;
+                    break;
+                }
+            } else {
+                damping *= 8.;
+                if damping > 1e16 {
+                    break;
+                }
+            }
+        }
+        let plasma = self.state(&x, &ind);
+        let j = self.jacobian(&x, &ind)?;
+        let h = j.transpose() * j;
+        let inverse = h.cholesky().map(|c| c.inverse());
+        let physical = [
+            plasma.electron_density_m3,
+            plasma.ion_temperature_k,
+            plasma.electron_temperature_k,
+            1000.,
+            plasma.ion_collision_s,
+        ];
+        let mut errors = [None; 5];
+        let mut covariance = vec![];
+        if let Some(inv) = inverse {
+            for (a, &i) in ind.iter().enumerate() {
+                errors[i] = Some(inv[(a, a)].max(0.).sqrt() * physical[i]);
+                for (b, &k) in ind.iter().enumerate() {
+                    covariance.push(inv[(a, b)] * physical[i] * physical[k]);
+                }
+            }
+        }
+        if self.settings.tie_electron_ion_temperature {
+            errors[2] = errors[1];
+        }
+        let at_boundary = ind
+            .iter()
+            .enumerate()
+            .any(|(k, &i)| (x[k] - bounds[i].0).abs() < 1e-4 || (x[k] - bounds[i].1).abs() < 1e-4);
+        let status = if at_boundary {
+            "parameter_boundary"
+        } else if covariance.is_empty() {
+            "singular"
+        } else if !converged {
+            "not_converged"
+        } else if errors[0].is_none_or(|e| e > plasma.electron_density_m3) {
+            "low_information"
+        } else {
+            "converged"
+        };
+        let dof = 2 * self.measurements.len() - n;
+        let predicted = self.predict(plasma)?.iter().map(|z| [z.re, z.im]).collect();
+        let residual = r.as_slice().as_chunks::<2>().0.to_vec();
+        Ok(FitResult {
+            plasma,
+            standard_error: errors,
+            conditional_standard_error: errors,
+            covariance,
+            free_parameter_indices: ind,
+            chi_square: cost,
+            degrees_of_freedom: dof,
+            reduced_chi_square: cost / dof as f64,
+            iterations,
+            status: status.into(),
+            predicted,
+            standardized_residual: residual,
+        })
+    }
+}
+
+impl FitProblem {
+    /// Cluster sandwich covariance: one independent cluster per input integration.
+    /// Includes correlation between every lag and range average within a cluster.
+    /// Variation of the plasma within the window also increases these errors.
+    pub fn temporal_uncertainty(&self, result: &mut FitResult, samples: &[Vec<C>]) -> Result<()> {
+        ensure!(
+            samples.len() >= 3
+                && samples.iter().all(|s| s.len() == self.measurements.len()
+                    && s.iter().all(|v| v.re.is_finite() && v.im.is_finite())),
+            "invalid temporal replicates"
+        );
+        let ind = self.indices();
+        let p = result.plasma;
+        let physical = [
+            p.electron_density_m3,
+            p.ion_temperature_k,
+            p.electron_temperature_k,
+            1000.,
+            p.ion_collision_s,
+        ];
+        let values = [
+            p.electron_density_m3,
+            p.ion_temperature_k,
+            p.electron_temperature_k,
+            p.velocity_m_s,
+            p.ion_collision_s,
+        ];
+        let x = DVector::from_iterator(
+            ind.len(),
+            ind.iter().map(|&i| match i {
+                0 => (values[i] / 1e11).ln(),
+                1 | 2 => (values[i] / 1000.).ln(),
+                3 => values[i] / 1000.,
+                4 => (values[i] / 1000.).ln(),
+                _ => unreachable!(),
+            }),
+        );
+        let j = self.jacobian(&x, &ind)?;
+        let Some(chol) = (j.transpose() * &j).cholesky() else {
+            result.status = "singular".into();
+            result.standard_error = [None; 5];
+            result.covariance.clear();
+            return Ok(());
+        };
+        let inverse = chol.inverse();
+        let mut meat = DMatrix::zeros(ind.len(), ind.len());
+        for sample in samples {
+            let d = DVector::from_iterator(
+                2 * sample.len(),
+                sample.iter().zip(&self.measurements).flat_map(|(v, m)| {
+                    [
+                        (v.re - m.value.re) / m.sigma[0],
+                        (v.im - m.value.im) / m.sigma[1],
+                    ]
+                }),
+            );
+            let score = j.transpose() * d;
+            meat += &score * score.transpose();
+        }
+        let mut cov = &inverse * meat * &inverse / (samples.len() * (samples.len() - 1)) as f64;
+        for a in 0..ind.len() {
+            cov[(a, a)] = cov[(a, a)].max(inverse[(a, a)]);
+        }
+        result.standard_error = [None; 5];
+        result.covariance.clear();
+        for (a, &i) in ind.iter().enumerate() {
+            result.standard_error[i] = Some(cov[(a, a)].max(0.).sqrt() * physical[i]);
+            for (b, &k) in ind.iter().enumerate() {
+                result
+                    .covariance
+                    .push(cov[(a, b)] * physical[i] * physical[k]);
+            }
+        }
+        if self.settings.tie_electron_ion_temperature {
+            result.standard_error[2] = result.standard_error[1];
+        }
+        if result.status == "converged"
+            && [0, 1, 2]
+                .iter()
+                .any(|&i| result.standard_error[i].is_none_or(|e| !e.is_finite() || e > values[i]))
+        {
+            result.status = "low_information".into();
+        }
+        Ok(())
+    }
+}

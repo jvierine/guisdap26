@@ -1,3 +1,4 @@
+mod ion;
 mod mat4;
 use anyhow::{ensure, Context, Result};
 use axum::response::IntoResponse;
@@ -22,6 +23,10 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    FitIon {
+        #[arg(long)]
+        config: PathBuf,
+    },
     Analyze {
         #[arg(long)]
         config: PathBuf,
@@ -562,6 +567,7 @@ fn export(input: &Path, output: &Path) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Args::parse().command {
+        Command::FitIon { config } => ion::run(&config),
         Command::Analyze {
             config,
             node_index,

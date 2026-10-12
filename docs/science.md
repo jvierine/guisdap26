@@ -228,3 +228,12 @@ not four sharply resolved altitude bins. A sequential plasma palette is shared
 across all panels. Numerical color limits are common to the four gates and remain
 fixed during playback. Signed residuals retain their sign and are displayed on
 a monotonic asinh scale; changing a palette never changes the stored estimator.
+
+## Ion-line parameter fits
+
+The separate `beata22-ionfit-v1` product fits measured ion-line lag responses in
+Rust. It does not replace the signed raw-Ne quick-look products described above.
+See [ion-fitting.md](ion-fitting.md) for the physical model, calibration,
+composition/collision assumptions, optimizer, uncertainty calculation, and limits.
+The current plasma-line frequency labels also remain provisional: the recorded
+ELAN oscillator selections and its user-parameter offset calculation disagree.

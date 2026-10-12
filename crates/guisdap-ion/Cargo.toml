@@ -1,0 +1,10 @@
+[package]
+name = "guisdap-ion"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+num-complex = "0.4"
+errorfunctions = "0.2"
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }

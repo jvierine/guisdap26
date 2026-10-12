@@ -6,7 +6,9 @@ The first vertical slice processes Tromsø UHF **BEATA 2.2, 2022-11-02,
 
 This is a research quick-look implementation, not yet a replacement for full
 GUISDAP inference. It displays signed 10 µs lag raw-Ne equivalents down to about 47.5 km, with approximate statistical error bars;
-it does not fit true electron density, temperature, or velocity.
+A separate Rust ion-line fitter now estimates density, temperatures, spectral velocity,
+and an effective collision rate, with explicit composition assumptions and fit flags.
+See [ion fitting](docs/ion-fitting.md) and the live [fit inspector](http://avaruus.uit.no/guisdap/ion.html).
 The equations, range responses and limitations are in [docs/science.md](docs/science.md).
 
 ## Working environment
@@ -24,7 +26,7 @@ The maintained `hdf5-metno` Rust binding supports avaruus's HDF5 1.14 installati
 
 ```sh
 cargo build --release -p guisdap-worker
-cargo test -p guisdap-core -p guisdap-worker
+cargo test --workspace
 target/release/guisdap-worker analyze --config config/avaruus.json
 target/release/guisdap-worker export \
   --input ~/data/guisdap/2022-11-02-v5 \
@@ -75,6 +77,7 @@ See [docs/deployment.md](docs/deployment.md).
 
 ## Layout
 
+- `crates/guisdap-ion`: stateless Maxwellian/BGK physics, nonlinear fitting, covariance.
 - `crates/guisdap-core`: numerical transforms and geometry, independent of I/O.
 - `crates/guisdap-worker`: native MAT reader, batch workers, HDF5 and static export.
 - `crates/guisdap-web`: Rust WASM application and WebGL2 heatmaps.
@@ -111,3 +114,8 @@ The optional GitHub Actions check definition is provided as
 `scripts/github-actions-check.yml`. It is a template, not an enabled workflow;
 the initial publishing credential lacks the GitHub workflow scope. The Rust tests,
 Clippy checks and WASM build are run on avaruus.
+
+For ion fitting, run `target/release/guisdap-worker fit-ion --config config/ion-fit-avaruus.json`.
+The fit inspector is `ion.html`; its static-product location is in `ion-config.json`.
+All new fitting and validation code is Rust. HDF5 preserves the full numerical
+results and provenance, and a static JSON export supplies the Rust/WASM viewer.

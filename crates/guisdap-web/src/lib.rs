@@ -1,5 +1,6 @@
 //! Static-hosted browser application. Data selection, scaling, UI and WebGL live in Rust.
 #![cfg(target_arch = "wasm32")]
+mod ion;
 use guisdap_core::{merge_bands, native_spectra};
 use serde::Deserialize;
 use std::{cell::RefCell, rc::Rc};
