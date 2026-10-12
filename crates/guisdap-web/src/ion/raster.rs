@@ -1,7 +1,13 @@
 use super::super::{el, error, shader};
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as Gl};
-pub fn draw(id: &str, values: &[f32], width: usize, height: usize) -> Result<(), JsValue> {
+pub fn draw(
+    id: &str,
+    values: &[f32],
+    width: usize,
+    height: usize,
+    seismic: bool,
+) -> Result<(), JsValue> {
     let canvas: HtmlCanvasElement = el(id).dyn_into()?;
     let gl: Gl = canvas
         .get_context("webgl2")?
@@ -12,9 +18,9 @@ pub fn draw(id: &str, values: &[f32], width: usize, height: usize) -> Result<(),
         &gl,
         Gl::FRAGMENT_SHADER,
         r#"#version 300 es
-precision highp float;in vec2 uv;out vec4 color;uniform sampler2D field;
+precision highp float;in vec2 uv;out vec4 color;uniform sampler2D field;uniform bool seismic;
 const vec3 palette[8]=vec3[8](vec3(13,8,135),vec3(84,3,160),vec3(139,10,165),vec3(185,50,137),vec3(219,92,104),vec3(244,136,73),vec3(254,188,43),vec3(240,249,33));
-void main(){float z=texture(field,uv).r;if(isnan(z)){color=vec4(.04,.07,.10,1);return;}bool flagged=z>=2.;float p=clamp(flagged?z-2.:z,0.,1.)*7.;int i=min(int(floor(p)),6);vec3 c=mix(palette[i],palette[i+1],p-float(i))/255.;if(flagged&&mod(gl_FragCoord.x+gl_FragCoord.y,8.)<1.5)c=mix(c,vec3(.8),.5);color=vec4(c,1);}
+void main(){float z=texture(field,uv).r;if(isnan(z)){color=vec4(.04,.07,.10,1);return;}bool flagged=z>=2.;float p=clamp(flagged?z-2.:z,0.,1.)*7.;int i=min(int(floor(p)),6);vec3 c=mix(palette[i],palette[i+1],p-float(i))/255.;if(seismic){vec3 a[5]=vec3[5](vec3(0,0,.3),vec3(0,0,1),vec3(1),vec3(1,0,0),vec3(.5,0,0));float q=clamp(flagged?z-2.:z,0.,1.)*4.;int j=min(int(floor(q)),3);c=mix(a[j],a[j+1],q-float(j));}if(flagged&&mod(gl_FragCoord.x+gl_FragCoord.y,16.)<1.)c=mix(c,vec3(.8),.22);color=vec4(c,1);}
 "#,
     )?;
     let program = gl
@@ -31,6 +37,10 @@ void main(){float z=texture(field,uv).r;if(isnan(z)){color=vec4(.04,.07,.10,1);r
         return Err(error(gl.get_program_info_log(&program).unwrap_or_default()));
     }
     gl.use_program(Some(&program));
+    gl.uniform1i(
+        gl.get_uniform_location(&program, "seismic").as_ref(),
+        i32::from(seismic),
+    );
     let texture = gl
         .create_texture()
         .ok_or_else(|| error("texture allocation"))?;

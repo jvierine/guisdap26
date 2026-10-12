@@ -123,6 +123,16 @@ struct Viewer {
     statuses: Vec<Option<Processing>>,
     refresh_busy: bool,
     drag: Option<(f64, f64)>,
+    scales: [[f64; 2]; 5],
+    quality_limit: f64,
+    mask_bad: bool,
+    hatch_bad: bool,
+}
+fn rejected(g: &Gate, limit: f64) -> bool {
+    g.status == "singular"
+        || g.result
+            .as_ref()
+            .is_none_or(|f| !f.reduced_chi_square.is_finite() || f.reduced_chi_square > limit)
 }
 fn selected(v: &Viewer) -> &Profile {
     v.details.get(&v.time).unwrap_or(&v.data.profiles[v.time])
@@ -141,6 +151,12 @@ fn line(s: &mut String, x1: f64, y1: f64, x2: f64, y2: f64, color: &str) {
     ));
 }
 fn label(s: &mut String, x: f64, y: f64, t: &str, anchor: &str) {
+    if let Some(exp) = t.strip_prefix("10^") {
+        if let Ok(math) = super::math_power(exp, x, y, anchor) {
+            s.push_str(&math);
+            return;
+        }
+    }
     s.push_str(&format!(
         "<text x='{x:.1}' y='{y:.1}' text-anchor='{anchor}'>{t}</text>"
     ));
@@ -209,6 +225,9 @@ fn profile(v: &Viewer, param: usize) -> String {
     label(&mut s, 65., 24., "Altitude / km", "start");
     s.push_str("<defs><clipPath id='fit-area'><rect x='64' y='39' width='227' height='423'/></clipPath></defs><g clip-path='url(#fit-area)'>");
     for (i, g) in p.gates.iter().enumerate().take(v.upper + 1).skip(v.lower) {
+        if v.mask_bad && rejected(g, v.quality_limit) {
+            continue;
+        }
         if let Some(f) = &g.result {
             let z = value(&f.plasma, param);
             let a = transform(z);
@@ -255,6 +274,20 @@ fn altitude_ticks(bottom: f64, top: f64) -> Vec<i32> {
         .step_by(step as usize)
         .collect()
 }
+fn seismic_color(t: f64) -> String {
+    let stops = [
+        [0., 0., 76.5],
+        [0., 0., 255.],
+        [255., 255., 255.],
+        [255., 0., 0.],
+        [127.5, 0., 0.],
+    ];
+    let p = t.clamp(0., 1.) * 4.;
+    let i = (p.floor() as usize).min(3);
+    let f = p - i as f64;
+    let c = [0, 1, 2].map(|k| (stops[i][k] * (1. - f) + stops[i + 1][k] * f).round() as u8);
+    format!("rgb({},{},{})", c[0], c[1], c[2])
+}
 fn plasma_color(t: f64) -> String {
     // Samples of the perceptually ordered plasma palette, linearly interpolated.
     let stops = [
@@ -279,12 +312,11 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
     let top = p.gates[v.upper].upper_km;
     let start = v.window_start;
     let end = v.window_end;
-    let (min, max) = match param {
-        0 | 4 => (8., 13.),
-        1 => (0., 4000.),
-        2 => (0., 8000.),
-        _ => (-1000., 1000.),
-    };
+    let [mut min, mut max] = v.scales[param];
+    if param == 0 || param == 4 {
+        min = min.log10();
+        max = max.log10();
+    }
     let nx = 1200usize;
     let ny = 240usize;
     let mut pixels = vec![f32::NAN; nx * ny];
@@ -310,7 +342,11 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
                 if g.status == "singular" {
                     continue;
                 }
-                (value(&f.plasma, param), g.status != "converged")
+                let bad = rejected(g, v.quality_limit);
+                if bad && v.mask_bad {
+                    continue;
+                }
+                (value(&f.plasma, param), bad && v.hatch_bad)
             };
             if !raw.is_finite() || ((param == 0 || param == 4) && raw <= 0.) {
                 continue;
@@ -320,11 +356,20 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
             } else {
                 raw
             };
-            pixels[iy * nx + ix] =
-                (((z - min) / (max - min)).clamp(0., 1.) + if flag { 2. } else { 0. }) as f32;
+            pixels[iy * nx + ix] = ((if param == 3 {
+                if z < 0. {
+                    0.5 * (1. - z / min)
+                } else {
+                    0.5 + 0.5 * z / max
+                }
+            } else {
+                (z - min) / (max - min)
+            })
+            .clamp(0., 1.)
+                + if flag { 2. } else { 0. }) as f32;
         }
     }
-    raster::draw(&format!("fit-raster-{param}"), &pixels, nx, ny)?;
+    raster::draw(&format!("fit-raster-{param}"), &pixels, nx, ny, param == 3)?;
     let mut s = svg(1100., 280.);
     let y = |h: f64| 220. - (h - bottom) / (top - bottom) * 180.;
     for h in altitude_ticks(bottom, top) {
@@ -346,17 +391,37 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
         s.push_str(&format!(
             "<rect x='978' y='{:.2}' width='13' height='1.9' fill='{}'/>",
             220. - (i + 1) as f64 * 1.8,
-            plasma_color(i as f64 / 99.)
+            if param == 3 {
+                seismic_color(i as f64 / 99.)
+            } else {
+                plasma_color(i as f64 / 99.)
+            }
         ));
     }
-    for i in 0..=5 {
-        let z = min + (max - min) * i as f64 / 5.;
+    let ticks = if param == 3 { 6 } else { 5 };
+    for i in 0..=ticks {
+        let t = i as f64 / ticks as f64;
+        let z = if param == 3 {
+            if t < 0.5 {
+                min * (1. - 2. * t)
+            } else {
+                max * (2. * t - 1.)
+            }
+        } else {
+            min + (max - min) * t
+        };
         let t = if param == 0 || param == 4 {
-            format!("10^{z:.0}")
+            format!("10^{z:.2}")
         } else {
             format!("{z:.0}")
         };
-        label(&mut s, 999., 224. - i as f64 * 36., &t, "start");
+        label(
+            &mut s,
+            999.,
+            224. - i as f64 / ticks as f64 * 180.,
+            &t,
+            "start",
+        );
     }
     s.push_str("</svg>");
     el(&format!("fit-map-{param}")).set_inner_html(&s);
@@ -530,6 +595,13 @@ fn render(v: &Viewer) {
     for i in 0..4 {
         el(&format!("fit-profile-{i}")).set_inner_html(&profile(v, i));
     }
+    text("fit-quality-value", &format!("{:.1}", v.quality_limit));
+    let rejected_count = p
+        .gates
+        .iter()
+        .filter(|g| rejected(g, v.quality_limit))
+        .count();
+    text("fit-quality-summary", &format!("Selected interval: {rejected_count}/{} gates rejected or unavailable. Higher threshold keeps more data.", p.gates.len()));
     let revision = v.data.processing.as_ref().map_or(0, |p| p.updated_unix);
     let key = (
         v.window_start.to_bits(),
@@ -864,11 +936,73 @@ pub async fn start_ion() -> Result<(), JsValue> {
         statuses,
         refresh_busy: false,
         drag: None,
+        scales: [
+            [1e8, 1e13],
+            [0., 2000.],
+            [0., 4000.],
+            [-1000., 1000.],
+            [1e8, 1e13],
+        ],
+        quality_limit: 10.,
+        mask_bad: false,
+        hatch_bad: true,
     }));
     render(&state.borrow());
     status_view(&state.borrow());
     load_detail(state.clone());
+    for (id, open) in [("fit-settings-open", true), ("fit-settings-close", false)] {
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            if open {
+                el("fit-settings").remove_attribute("hidden").unwrap();
+            } else {
+                el("fit-settings").set_attribute("hidden", "").unwrap();
+            }
+            el("fit-settings-open")
+                .set_attribute("aria-expanded", if open { "true" } else { "false" })
+                .unwrap();
+        });
+        el(id).add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+    for param in 0..5 {
+        for edge in 0..2 {
+            let id = format!("fit-scale-{param}-{edge}");
+            let state = state.clone();
+            let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                let read = |k| {
+                    el(&format!("fit-scale-{param}-{k}"))
+                        .dyn_into::<HtmlInputElement>()
+                        .unwrap()
+                        .value()
+                        .parse::<f64>()
+                        .ok()
+                };
+                if let (Some(a), Some(b)) = (read(0), read(1)) {
+                    if a.is_finite()
+                        && b.is_finite()
+                        && a < b
+                        && (!(param == 0 || param == 4) || a > 0.)
+                        && (param != 3 || (a < 0. && b > 0.))
+                    {
+                        let mut v = state.borrow_mut();
+                        v.scales[param] = [a, b];
+                        v.map_key.set(None);
+                        render(&v);
+                        text("fit-scale-error", "");
+                        return;
+                    }
+                }
+                text("fit-scale-error", "Colour limits need finite min < max; density limits must be positive; velocity limits must straddle zero.");
+            });
+            el(&id).add_event_listener_with_callback("input", cb.as_ref().unchecked_ref())?;
+            el(&id).add_event_listener_with_callback("change", cb.as_ref().unchecked_ref())?;
+            cb.forget();
+        }
+    }
     for (id, event) in [
+        ("fit-quality", "input"),
+        ("fit-mask-bad", "change"),
+        ("fit-hatch-bad", "change"),
         ("fit-slider", "input"),
         ("fit-gate", "change"),
         ("fit-altitude", "input"),
@@ -888,6 +1022,26 @@ pub async fn start_ion() -> Result<(), JsValue> {
                 let mut v = state.borrow_mut();
                 let last = v.data.profiles[v.time].gates.len() - 1;
                 match id {
+                    "fit-quality" | "fit-mask-bad" | "fit-hatch-bad" => {
+                        v.quality_limit = 10_f64.powf(
+                            el("fit-quality")
+                                .dyn_into::<HtmlInputElement>()
+                                .unwrap()
+                                .value()
+                                .parse::<f64>()
+                                .unwrap_or(1.),
+                        );
+                        v.mask_bad = el("fit-mask-bad")
+                            .dyn_into::<HtmlInputElement>()
+                            .unwrap()
+                            .checked();
+                        v.hatch_bad = el("fit-hatch-bad")
+                            .dyn_into::<HtmlInputElement>()
+                            .unwrap()
+                            .checked();
+                        v.map_key.set(None);
+                    }
+
                     "fit-window-start" | "fit-window-end" => {
                         let day = (v.data.profiles[0].start_unix / 86400.).floor() * 86400.;
                         let a = el("fit-window-start")
@@ -981,7 +1135,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
         cb.forget();
     }
     for param in 0..5 {
-        for event in ["mousedown", "mouseup", "mousemove"] {
+        for event in ["mousedown", "mouseup", "mousemove", "mouseleave"] {
             let state = state.clone();
             let id = format!("fit-raster-{param}");
             let canvas_id = id.clone();
@@ -994,6 +1148,11 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         ((event_data.client_y() as f64 - rect.y()) / rect.height()).clamp(0., 1.);
                     let mut v = state.borrow_mut();
                     let t = v.window_start + x * (v.window_end - v.window_start);
+                    if event == "mouseleave" {
+                        v.drag = None;
+                        selection(None);
+                        return;
+                    }
                     if event == "mousedown" {
                         v.drag = Some((x, t));
                         return;
@@ -1007,12 +1166,24 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         .partition_point(|g| g.upper_km <= h)
                         .min(v.upper);
                     if event == "mousemove" {
+                        if let Some((x0, t0)) = v.drag {
+                            if event_data.buttons() == 0 {
+                                v.drag = None;
+                                selection(None);
+                            } else {
+                                selection(Some((x0, x, t0, t)));
+                            }
+                        }
                         let p = &v.data.profiles[ti];
                         let g = &p.gates[gi];
                         let val = if param == 4 {
                             p.raw_ne.get(gi).and_then(|a| *a).map(|a| a[0])
                         } else {
-                            g.result.as_ref().map(|f| value(&f.plasma, param))
+                            if v.mask_bad && rejected(g, v.quality_limit) {
+                                None
+                            } else {
+                                g.result.as_ref().map(|f| value(&f.plasma, param))
+                            }
                         };
                         text(
                             "fit-hover",
@@ -1022,16 +1193,29 @@ pub async fn start_ion() -> Result<(), JsValue> {
                                 clock(p.end_unix),
                                 g.lower_km,
                                 g.upper_km,
-                                val.map_or("no value".into(), |n| format!("{n:.4e}")),
+                                val.map_or("NaN / unavailable".into(), |n| format!("{n:.4e}")),
                                 if param == 4 {
-                                    "raw 10 µs lag"
+                                    "raw 10 µs lag".to_string()
                                 } else {
-                                    &g.status
+                                    format!(
+                                        "{} · score {} · {}",
+                                        g.status,
+                                        g.result.as_ref().map_or(
+                                            "unavailable".into(),
+                                            |f| format!("{:.2}", f.reduced_chi_square)
+                                        ),
+                                        if rejected(g, v.quality_limit) {
+                                            "rejected"
+                                        } else {
+                                            "within threshold"
+                                        }
+                                    )
                                 }
                             ),
                         );
                         return;
                     }
+                    selection(None);
                     if let Some((x0, t0)) = v.drag.take() {
                         if (x - x0).abs() > 0.005 {
                             set_window(&mut v, t.min(t0), t.max(t0));
@@ -1065,4 +1249,14 @@ pub async fn start_ion() -> Result<(), JsValue> {
     poll.forget();
     spawn_local(refresh(state, location.study_status_url));
     Ok(())
+}
+
+fn selection(region: Option<(f64, f64, f64, f64)>) {
+    let markup = region.map_or(String::new(), |(a,b,t0,t1)| {
+        let x=60.+890.*a.min(b); let w=890.*(a-b).abs();
+        format!("<svg viewBox='0 0 1100 280' style='width:100%;display:block'><rect x='{x}' y='40' width='{w}' height='180' fill='#70d6cf' fill-opacity='.22' stroke='#a9fff3' stroke-width='2'/><text x='60' y='18' fill='#a9fff3' font-size='13'>Zoom: {}–{} UTC</text></svg>",clock(t0.min(t1)),clock(t0.max(t1)))
+    });
+    for i in 0..5 {
+        el(&format!("fit-selection-{i}")).set_inner_html(&markup);
+    }
 }

@@ -469,7 +469,10 @@ fn profile(a: &App, indices: &[usize]) {
     }
     for exp in 8..=13 {
         let xx = x(10f64.powi(exp));
-        svg+=&format!("<path d='M{xx} 30 V310' stroke='#293743'/><text x='{xx}' y='332' text-anchor='middle'>10^{exp}</text>");
+        svg += &format!("<path d='M{xx} 30 V310' stroke='#293743'/>");
+        if let Ok(label) = math_power(&exp.to_string(), xx, 332., "middle") {
+            svg += &label;
+        }
     }
     let mut path = String::new();
     let mut connected = false;
@@ -973,4 +976,40 @@ pub async fn start() -> Result<(), JsValue> {
         )?;
     tick.forget();
     Ok(())
+}
+
+fn math_power(exponent: &str, x: f64, y: f64, anchor: &str) -> Result<String, JsValue> {
+    let mj = js_sys::Reflect::get(&web_sys::window().unwrap(), &"MathJax".into())?;
+    let convert: js_sys::Function = js_sys::Reflect::get(&mj, &"tex2svg".into())?.dyn_into()?;
+    let node: web_sys::Element = convert
+        .call1(
+            &mj,
+            &format!(
+                "10^{{{}}}",
+                exponent.strip_suffix(".00").unwrap_or(exponent)
+            )
+            .into(),
+        )?
+        .dyn_into()?;
+    let svg = node
+        .query_selector("svg")?
+        .ok_or_else(|| error("MathJax SVG missing"))?;
+    let width = if exponent.ends_with(".00") || !exponent.contains('.') {
+        30.
+    } else {
+        42.
+    };
+    let left = x - if anchor == "middle" {
+        width / 2.
+    } else if anchor == "end" {
+        width
+    } else {
+        0.
+    };
+    svg.set_attribute("x", &left.to_string())?;
+    svg.set_attribute("y", &(y - 15.).to_string())?;
+    svg.set_attribute("width", &width.to_string())?;
+    svg.set_attribute("height", "18")?;
+    svg.set_attribute("style", "color:#b6c8d8;overflow:visible")?;
+    Ok(svg.outer_html())
 }

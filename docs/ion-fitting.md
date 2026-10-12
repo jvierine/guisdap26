@@ -185,3 +185,18 @@ altitude bins, not fitted Ne or a newly inferred zero-lag estimate. Its uncertai
 conservatively treats range samples as correlated and temporal samples as
 independent, with empirical temporal variance as a lower bound. Negative estimates
 remain in HDF5/JSON and are blank on logarithmic colour scales.
+
+
+## Interactive display controls
+
+The gear panel controls UTC/altitude bounds, a maximum weighted residual score
+(default 10; logarithmic slider 0.1–1000), optional NaN display masking, hatching,
+and each row's colour limits. Rejection follows the score rather than treating
+every non-converged status as a hatch. Original status remains visible in hover
+and diagnostics; a low score does not establish convergence or scientific validity.
+Missing/singular fits remain unavailable. Masking leaves HDF5 and measured ACFs
+unchanged. Raw Ne is not filtered by fit quality. Settings survive resolution
+changes during the session. Te defaults to 0–4000 K; Ti to 0–2000 K. Velocity uses
+a seismic blue–white–red scale centred at zero, including asymmetric limits.
+Dragging previews the shared time selection across all rows; leaving the plot
+cancels the drag. Powers of ten use locally served MathJax 3.2.2 SVG rendering.
