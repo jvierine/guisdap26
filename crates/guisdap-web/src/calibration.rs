@@ -89,6 +89,7 @@ struct Pending {
     profile: Profile,
 }
 pub(super) struct Calibration {
+    sync: Rc<RefCell<Sync>>,
     suppress_click: bool,
     app: State,
     response: Option<Response>,
@@ -105,6 +106,11 @@ fn input(id: &str) -> HtmlInputElement {
     el(id).dyn_into().unwrap()
 }
 fn save(c: &Calibration) {
+    {
+        let mut sync = c.sync.borrow_mut();
+        sync.pending = Some(serde_json::to_value(&c.points).unwrap());
+    }
+    flush(c.sync.clone());
     if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
         if let Ok(s) = serde_json::to_string(&c.points) {
             let _ = storage.set_item(KEY, &s);
@@ -582,7 +588,31 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
         .and_then(|s| s.get_item(KEY).ok().flatten())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    let storage = web_sys::window()
+        .unwrap()
+        .local_storage()?
+        .ok_or_else(|| error("Browser storage unavailable"))?;
+    let key = if let Some(k) = storage.get_item("guisdap26-calibration-notebook")? {
+        k
+    } else {
+        let mut bytes = [0u8; 32];
+        web_sys::window()
+            .unwrap()
+            .crypto()?
+            .get_random_values_with_u8_array(&mut bytes)?;
+        let k = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        storage.set_item("guisdap26-calibration-notebook", &k)?;
+        k
+    };
+    let sync = Rc::new(RefCell::new(Sync {
+        key,
+        revision: 0,
+        ready: false,
+        busy: false,
+        pending: None,
+    }));
     let state = Rc::new(RefCell::new(Calibration {
+        sync: sync.clone(),
         suppress_click: false,
         app: app.clone(),
         response: None,
@@ -596,6 +626,40 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
     app.borrow_mut().calibration = Some(state.clone());
     gestures(&state)?;
     table(&state);
+    let loaded = state.clone();
+    spawn_local(async move {
+        let key = loaded.borrow().sync.borrow().key.clone();
+        let result: Result<(), JsValue> = async {
+            let n: Saved = json(&format!("api/calibrations/{key}")).await?;
+            {
+                let mut c = loaded.borrow_mut();
+                if n.revision > 0 {
+                    c.points = n.points;
+                }
+                let mut sync = c.sync.borrow_mut();
+                sync.revision = n.revision;
+                sync.ready = true;
+            }
+            let settings: Settings = json("calibration-config.json").await?;
+            let fits: Fits = json(&settings.ion_index_url).await?;
+            let response: Response = json("data/beata-short-lag-response.json").await?;
+            {
+                let mut c = loaded.borrow_mut();
+                c.settings = Some(settings);
+                c.fits = Some(fits);
+                c.response = Some(response);
+            }
+            table(&loaded);
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            text(
+                "cal-save-status",
+                &format!("Server unavailable; browser copy retained. {e:?}"),
+            );
+        }
+    });
     for id in [
         "cal-altitude",
         "cal-frequency",
@@ -639,7 +703,8 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
                     }
                 }
             }
-            preview(&c);
+            drop(c);
+            update_current(&s);
         })?;
     }
     for event_name in ["pointerdown", "pointermove"] {
@@ -687,7 +752,8 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
                     .unwrap()
                     .set_value(&i.to_string());
                 drop(app);
-                preview(&c);
+                drop(c);
+                update_current(&st);
             }
         })?;
     }
@@ -841,11 +907,14 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
                         profile,
                     });
                     candidates(&st.borrow(), bounds);
-                    set_height(&st.borrow(), (bounds[0] + bounds[1]) / 2.);
+                    let peak = peak_height(&st.borrow(), bounds).ok_or_else(|| {
+                        error("No finite positive raw Ne within this gate and time window")
+                    })?;
+                    set_height(&st.borrow(), peak);
                     select(app, selected).await?;
                     let candidate = point(&st.borrow());
                     if let Ok(mut p) = candidate {
-                        p.included = false; // Source altitude is provisional until the user places the point.
+                        p.included = false; // Peak association remains reviewable before inclusion.
                         let mut c = st.borrow_mut();
                         let i = c.points.len();
                         c.points.push(p);
@@ -1261,4 +1330,132 @@ fn gestures(state: &Cal) -> Result<(), JsValue> {
         })?;
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct Saved {
+    revision: u64,
+    points: Vec<Point>,
+}
+struct Sync {
+    key: String,
+    revision: u64,
+    ready: bool,
+    busy: bool,
+    pending: Option<serde_json::Value>,
+}
+fn flush(state: Rc<RefCell<Sync>>) {
+    {
+        let mut s = state.borrow_mut();
+        if !s.ready || s.busy {
+            return;
+        }
+        s.busy = true;
+    }
+    spawn_local(async move {
+        loop {
+            let (key, revision, points) = {
+                let mut s = state.borrow_mut();
+                let Some(p) = s.pending.take() else {
+                    s.busy = false;
+                    break;
+                };
+                (s.key.clone(), s.revision, p)
+            };
+            text("cal-save-status", "Saving calibration to server…");
+            let result: Result<Saved, JsValue> = async {
+                let init = web_sys::RequestInit::new();
+                init.set_method("PUT");
+                let body = serde_json::json!({"revision":revision,"points":points}).to_string();
+                init.set_body(&JsValue::from_str(&body));
+                let headers = js_sys::Object::new();
+                js_sys::Reflect::set(&headers, &"Content-Type".into(), &"application/json".into())?;
+                init.set_headers(&headers);
+                let response = JsFuture::from(
+                    web_sys::window()
+                        .unwrap()
+                        .fetch_with_str_and_init(&format!("api/calibrations/{key}"), &init),
+                )
+                .await?
+                .dyn_into::<web_sys::Response>()?;
+                if !response.ok() {
+                    return Err(error(format!(
+                        "HTTP {} (reload before editing if another tab changed this notebook)",
+                        response.status()
+                    )));
+                }
+                let value = JsFuture::from(response.text()?).await?.as_string().unwrap();
+                serde_json::from_str(&value).map_err(|e| error(e.to_string()))
+            }
+            .await;
+            match result {
+                Ok(n) => {
+                    state.borrow_mut().revision = n.revision;
+                    text(
+                        "cal-save-status",
+                        &format!(
+                            "Saved on avaruus · revision {} · browser copy retained",
+                            n.revision
+                        ),
+                    );
+                }
+                Err(e) => {
+                    let mut s = state.borrow_mut();
+                    if s.pending.is_none() {
+                        s.pending = Some(points);
+                    }
+                    s.busy = false;
+                    text(
+                        "cal-save-status",
+                        &format!("Not saved on server; browser copy retained. {e:?}"),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+fn update_current(state: &Cal) {
+    let p = point(&state.borrow());
+    if let Ok(p) = p {
+        let mut c = state.borrow_mut();
+        if let Some(i) = c.editing {
+            c.points[i] = p;
+        }
+    }
+    table(state);
+    preview(&state.borrow());
+}
+fn peak_height(c: &Calibration, bounds: [f64; 2]) -> Option<f64> {
+    let p = c.pending.as_ref()?;
+    let a = c.app.borrow();
+    let width = input("cal-time-width").value().parse::<f64>().ok()?;
+    let n = a.m.frames.len();
+    a.m.ion_range_km
+        .iter()
+        .enumerate()
+        .filter_map(|(g, &r)| {
+            let mut sum = 0.;
+            let mut weight = 0.;
+            let mut height = 0.;
+            for (t, f) in a.m.frames.iter().enumerate() {
+                let mid = (f.start_unix + f.end_unix) / 2.;
+                let h = altitude(r, f.elevation_deg);
+                let v = a.power[g * n + t] as f64;
+                if mid >= p.time - width / 2.
+                    && mid < p.time + width / 2.
+                    && h >= bounds[0]
+                    && h <= bounds[1]
+                    && v.is_finite()
+                {
+                    let w = f.end_unix - f.start_unix;
+                    sum += v * w;
+                    height += h * w;
+                    weight += w;
+                }
+            }
+            (weight > 0. && sum > 0.).then(|| (height / weight, sum / weight))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|p| p.0)
 }

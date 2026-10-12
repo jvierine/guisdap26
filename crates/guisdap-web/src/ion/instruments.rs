@@ -43,7 +43,7 @@ pub(super) fn render(v: &Viewer) {
     .iter()
     .enumerate()
     {
-        let values: Vec<_> = data
+        let mut values: Vec<_> = data
             .records
             .iter()
             .filter(|r| r.end_unix > v.window_start && r.start_unix < v.window_end)
@@ -72,7 +72,23 @@ pub(super) fn render(v: &Viewer) {
                 .map(transform)
                 .fold(f64::NEG_INFINITY, f64::max);
             let pad = ((hi - lo) * 0.1).max(hi.abs() * 0.002).max(0.01);
-            let (lo, hi) = (lo - pad, hi + pad);
+            let (lo, hi) = if column == 0 {
+                values.sort_by(f64::total_cmp);
+                let n = values.len();
+                let median = (values[(n - 1) / 2] + values[n / 2]) / 2.;
+                let cap = 2. * median;
+                let count = values.iter().filter(|x| **x > cap).count();
+                label(
+                    &mut s,
+                    950.,
+                    18.,
+                    &format!("Upper limit: 2 × median = {cap:.1} K · {count} above limit"),
+                    "end",
+                );
+                (lo - pad, cap.log10())
+            } else {
+                (lo - pad, hi + pad)
+            };
             let x = |t: f64| 60. + 890. * (t - v.window_start) / (v.window_end - v.window_start);
             let y = |a: f64| 110. - 75. * (a - lo) / (hi - lo);
             for i in 0..=2 {
@@ -103,6 +119,17 @@ pub(super) fn render(v: &Viewer) {
                 }
                 if let Some(value) = r.value(column).filter(|a| column != 0 || *a > 0.) {
                     let value = transform(value);
+                    if value > hi {
+                        let px =
+                            x(((r.start_unix + r.end_unix) / 2.)
+                                .clamp(v.window_start, v.window_end));
+                        s.push_str(&format!(
+                            "<path d='M{},39 L{px},35 L{},39' fill='none' stroke='#efbc50'/>",
+                            px - 2.,
+                            px + 2.
+                        ));
+                        continue;
+                    }
                     s.push_str(&format!(
                         "<circle cx='{}' cy='{}' r='1' fill='#efbc50'/>",
                         x(((r.start_unix + r.end_unix) / 2.).clamp(v.window_start, v.window_end)),

@@ -1,0 +1,10 @@
+[Unit]
+Description=GUISDAP calibration data storage
+[Service]
+Environment=GUISDAP_CALIBRATION_ROOT=/home/j/data/guisdap/2022-11-02/calibration
+ExecStart=/home/j/src/guisdap26/target/release/calibration-store
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+[Install]
+WantedBy=default.target

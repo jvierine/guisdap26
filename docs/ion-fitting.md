@@ -233,3 +233,72 @@ uses medians). It estimates receiver-plus-sky noise, not electron temperature.
 Absolute calibration uncertainty is not estimated. Internal data is retained in
 HDF5; the static browser consumes the atomic JSON export. Export once per source
 collection, and refresh when records are added.
+
+### Plasma-line calibration
+
+The plasma viewer now supports explicit broad-gate time/frequency selections,
+manual altitude adjustment (click/drag the candidate plot or use its slider),
+one-minute Te/Ti lookup, editable saved points, inclusion/exclusion, an accumulating
+calibration plot and portable JSON export. Browser local storage preserves points.
+Nothing changes the processing configuration automatically.
+
+`export_calibration_response` exports the first-lag response from the experiment's
+`lpg_wom`, including quadrature weights, ND and the same peak response normalization
+used by `ion_short_raw_ne`. It checks all 431 native gate positions and ND values,
+including partial gates, against the raw proxy. No ideal-lag substitution is used.
+For each selected native gate, the Rust/WASM Maxwellian spectrum is evaluated at
+the thermally corrected plasma-line density with the selected one-minute fitted
+Te, Ti, velocity, effective collision rate and recorded model composition. Let
+`R10 = integral(S * kernel_real)`. Then the predicted raw proxy is `2 Ne R10`,
+and the candidate multiplier ratio is this prediction divided by the measured
+raw proxy. The zero-lag equivalent raw Ne is `raw / (D R10)`, where
+`D=(1+k²lambdaD²)(1+k²lambdaD²+Te/Ti)`. The equivalent power remains conditional
+on the fitted local homogeneous shape and composition, not an independent
+zero-lag measurement.
+
+Time and altitude averaging widths are configurable; complete available temporal
+bins are selected by midpoint. The plasma viewer resolution sets the minimum
+available time resolution. Signed raw samples are preserved in averages, but
+nonpositive resulting power cannot supply a positive calibration factor.
+Temperatures are selected from the one-minute fit containing the clicked time;
+altitude adjustment uses its nearest fitted gate, while power uses the selected
+altitude window on the native short-lag grid. Uncertainty from temporal/range
+variation of the spectral shape is not yet propagated.
+
+Plasma density uses the unmagnetized Bohm–Gross approximation, with no magnetic
+field or drift correction. Negative thermally corrected density is rejected;
+`k²lambdaD² >= 0.1` and poor fits start excluded. This flag highlights the
+long-wavelength approximation and is not a calibrated validity boundary.
+Frequency mapping and feature/altitude identification still need scientific
+validation. The output records the original multiplier, correction direction,
+fit status/uncertainties, time/altitude windows, spectrum bin width and source
+ion product. The current event's reference multiplier is 0.7; a power gain in
+the radar equation changes by the reciprocal multiplier ratio.
+
+Equations: Vadas & Nicolls (2009), doi:10.1016/j.jastp.2009.01.011;
+finite-Debye relation also reproduced in Rexer et al. (2026), Eq. 3,
+https://gi.copernicus.org/articles/15/127/2026/ .
+
+### Calibration storage and interaction
+Calibration notebooks autosave beside the observation in
+`/home/j/data/guisdap/2022-11-02/calibration/<notebook-key>/` on avaruus.
+Every update creates an immutable HDF5 revision containing the complete UTF-8
+JSON notebook in `notebook_json_utf8`; `latest.json` is an atomic read cache.
+The random 256-bit notebook key stays in browser storage and acts as a private
+capability; it is not a user account or a public notebook index. JSON export
+remains available for portability. Revision checks reject stale writes rather
+than silently overwriting another tab. Static-only deployments retain browser
+storage/export; the autosave status explicitly reports unavailable servers.
+The Rust `calibration-store` binary listens on loopback port 8091 behind Apache.
+See `scripts/guisdap-calibration.service` and `scripts/apache-calibration.conf`.
+
+Initial altitude is the maximum positive, finite raw Ne value among native
+range gates inside the selected broad response bounds, averaged over the
+selected time window. Constant amplitude calibration does not change its
+location. This is a candidate association, not proof that a broad-gate feature
+comes from that layer. New points start excluded for review. Dragging sets
+continuous altitude; the nearest one-minute fit supplies the spectral shape.
+Calibration details and point lists have fixed display areas to prevent page
+movement during editing. Parameter-map rectangle zoom selects time and
+altitude together. Tsys display is capped at twice the median positive native
+Tsys in the visible time window; off-scale markers retain awareness of outliers.

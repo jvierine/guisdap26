@@ -126,7 +126,7 @@ struct Viewer {
     map_key: std::cell::Cell<Option<MapKey>>,
     statuses: Vec<Option<Processing>>,
     refresh_busy: bool,
-    drag: Option<(f64, f64)>,
+    drag: Option<(f64, f64, f64)>,
     scales: [[f64; 2]; 5],
     quality_limit: f64,
     quality: guisdap_core::quality::Limits,
@@ -381,12 +381,20 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
         }
     }
     raster::draw(&format!("fit-raster-{param}"), &pixels, nx, ny, param == 3)?;
-    let mut s = svg(1100., 280.);
+    let mut s = svg(1100., 280.).replace("0 0 1100 280", "0 30 1100 225");
     let y = |h: f64| 220. - (h - bottom) / (top - bottom) * 180.;
     for h in altitude_ticks(bottom, top) {
         label(&mut s, 52., y(h as f64) + 4., &h.to_string(), "end");
     }
-    label(&mut s, 60., 25., "Altitude / km", "start");
+    s.push_str("<text x='12' y='130' text-anchor='middle' transform='rotate(-90 12 130)'>Altitude / km</text>");
+    let parameter = [
+        "Ne / m⁻³",
+        "Ti / K",
+        "Te / K",
+        "Velocity / m s⁻¹",
+        "Raw Ne / m⁻³",
+    ][param];
+    s.push_str(&format!("<text x='1080' y='130' text-anchor='middle' transform='rotate(-90 1080 130)'>{parameter}</text>"));
     for i in 0..=4 {
         let t = start + (end - start) * i as f64 / 4.;
         label(
@@ -397,7 +405,7 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
             "middle",
         );
     }
-    label(&mut s, 505., 270., "Time / UTC", "middle");
+
     for i in 0..100 {
         s.push_str(&format!(
             "<rect x='978' y='{:.2}' width='13' height='1.9' fill='{}'/>",
@@ -447,7 +455,7 @@ fn cursor(v: &Viewer, param: usize) {
         + 890. * ((p.start_unix + p.end_unix) / 2. - v.window_start)
             / (v.window_end - v.window_start);
     let y = 220. - (g.altitude_km - bottom) / (top - bottom) * 180.;
-    let mut s = svg(1100., 280.);
+    let mut s = svg(1100., 280.).replace("0 0 1100 280", "0 30 1100 225");
     if (60. ..=950.).contains(&x) {
         line(&mut s, x, 40., x, 220., "#ffffff");
         line(&mut s, x - 4., y, x + 4., y, "#ffffff");
@@ -856,6 +864,18 @@ async fn change_resolution(state: Rc<RefCell<Viewer>>, resolution: usize) -> Res
             .partition_point(|g| g.upper_km <= height)
             .clamp(lower, upper);
         let max = (gates.len() - 1).to_string();
+        el("fit-gate").set_inner_html(
+            &gates
+                .iter()
+                .enumerate()
+                .map(|(i, g)| {
+                    format!(
+                        "<option value='{i}'>{:.1}–{:.1} km</option>",
+                        g.lower_km, g.upper_km
+                    )
+                })
+                .collect::<String>(),
+        );
         v.lower = lower;
         v.upper = upper;
         v.gate = gate;
@@ -1281,7 +1301,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         if event_data.button() != 0 {
                             return;
                         }
-                        v.drag = Some((x, t));
+                        v.drag = Some((x, y, t));
                         return;
                     }
                     let ti = fit_index(&v.data, t);
@@ -1293,12 +1313,12 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         .partition_point(|g| g.upper_km <= h)
                         .min(v.upper);
                     if event == "mousemove" {
-                        if let Some((x0, t0)) = v.drag {
+                        if let Some((x0, y0, t0)) = v.drag {
                             if event_data.buttons() == 0 {
                                 v.drag = None;
                                 selection(None);
                             } else {
-                                selection(Some((x0, x, t0, t)));
+                                selection(Some((x0, x, y0, y, t0, t)));
                             }
                         }
                         let p = &v.data.profiles[ti];
@@ -1346,9 +1366,25 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         return;
                     }
                     selection(None);
-                    if let Some((x0, t0)) = v.drag.take() {
-                        if (x - x0).abs() > 0.005 {
-                            set_window(&mut v, t.min(t0), t.max(t0));
+                    if let Some((x0, y0, t0)) = v.drag.take() {
+                        if (x - x0).abs() > 0.005 || (y - y0).abs() > 0.02 {
+                            if (y - y0).abs() > 0.02 {
+                                let h0 = top - y0 * (top - bottom);
+                                let gates = &v.data.profiles[ti].gates;
+                                let lower = gates
+                                    .partition_point(|g| g.upper_km <= h.min(h0))
+                                    .min(gates.len() - 1);
+                                let upper = gates
+                                    .partition_point(|g| g.lower_km < h.max(h0))
+                                    .saturating_sub(1)
+                                    .max(lower)
+                                    .min(gates.len() - 1);
+                                v.lower = lower;
+                                v.upper = upper;
+                            }
+                            if (x - x0).abs() > 0.005 {
+                                set_window(&mut v, t.min(t0), t.max(t0));
+                            }
                         } else {
                             v.time = ti;
                             v.gate = gi;
@@ -1381,10 +1417,10 @@ pub async fn start_ion() -> Result<(), JsValue> {
     Ok(())
 }
 
-fn selection(region: Option<(f64, f64, f64, f64)>) {
-    let markup = region.map_or(String::new(), |(a,b,t0,t1)| {
-        let x=60.+890.*a.min(b); let w=890.*(a-b).abs();
-        format!("<svg viewBox='0 0 1100 280' style='width:100%;display:block'><rect x='{x}' y='40' width='{w}' height='180' fill='#70d6cf' fill-opacity='.22' stroke='#a9fff3' stroke-width='2'/><text x='60' y='18' fill='#a9fff3' font-size='13'>Zoom: {}–{} UTC</text></svg>",clock(t0.min(t1)),clock(t0.max(t1)))
+fn selection(region: Option<(f64, f64, f64, f64, f64, f64)>) {
+    let markup = region.map_or(String::new(), |(a,b,c,d,t0,t1)| {
+        let x=60.+890.*a.min(b); let w=890.*(a-b).abs();let y=40.+180.*c.min(d);let h=180.*(c-d).abs();
+        format!("<svg viewBox='0 30 1100 225' style='width:100%;display:block'><rect x='{x}' y='{y}' width='{w}' height='{h}' fill='#70d6cf' fill-opacity='.22' stroke='#a9fff3' stroke-width='2'/><text x='60' y='55' fill='#a9fff3' font-size='13'>Zoom: {}–{} UTC</text></svg>",clock(t0.min(t1)),clock(t0.max(t1)))
     });
     for i in 0..5 {
         el(&format!("fit-selection-{i}")).set_inner_html(&markup);
