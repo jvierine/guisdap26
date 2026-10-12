@@ -1279,12 +1279,18 @@ pub async fn start_ion() -> Result<(), JsValue> {
         reset.forget();
     }
     for param in 0..5 {
-        for event in ["mousedown", "mouseup", "mousemove", "mouseleave"] {
+        for event in [
+            "pointerdown",
+            "pointerup",
+            "pointermove",
+            "pointercancel",
+            "lostpointercapture",
+        ] {
             let state = state.clone();
             let id = format!("fit-raster-{param}");
             let canvas_id = id.clone();
-            let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(
-                move |event_data: web_sys::MouseEvent| {
+            let cb = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
+                move |event_data: web_sys::PointerEvent| {
                     let rect = el(&canvas_id).get_bounding_client_rect();
                     let x =
                         ((event_data.client_x() as f64 - rect.x()) / rect.width()).clamp(0., 1.);
@@ -1292,15 +1298,17 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         ((event_data.client_y() as f64 - rect.y()) / rect.height()).clamp(0., 1.);
                     let mut v = state.borrow_mut();
                     let t = v.window_start + x * (v.window_end - v.window_start);
-                    if event == "mouseleave" {
+                    if event == "pointercancel" || event == "lostpointercapture" {
                         v.drag = None;
                         selection(None);
                         return;
                     }
-                    if event == "mousedown" {
+                    if event == "pointerdown" {
                         if event_data.button() != 0 {
                             return;
                         }
+                        event_data.prevent_default();
+                        let _ = el(&canvas_id).set_pointer_capture(event_data.pointer_id());
                         v.drag = Some((x, y, t));
                         return;
                     }
@@ -1312,7 +1320,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         .gates
                         .partition_point(|g| g.upper_km <= h)
                         .min(v.upper);
-                    if event == "mousemove" {
+                    if event == "pointermove" {
                         if let Some((x0, y0, t0)) = v.drag {
                             if event_data.buttons() == 0 {
                                 v.drag = None;
