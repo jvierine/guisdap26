@@ -14,7 +14,7 @@ main{overflow-anchor:none}.scrubber{overflow-anchor:none}
 /* Sequential plasma palette; identical endpoints to the Rust/WebGL shader. */
 .scale:before{display:none}.colorbar{display:inline-block;width:150px;height:10px;flex-shrink:0;background:linear-gradient(90deg,#0d0887,#330597,#5002a2,#6a00a8,#8405a7,#9c179e,#b12a90,#c33d80,#d35171,#e16462,#ed7953,#f68f44,#fca636,#fec029,#f9dc24,#f0f921)}
 .broad-panel canvas{height:170px}.broad-panel .plot-title{margin-bottom:8px}.scale{flex-wrap:wrap;min-height:20px}
-#power-uncertainty{min-height:78px}
+#power-uncertainty{min-height:110px}
 
 .animation-grid{grid-template-columns:minmax(0,2fr) minmax(340px,1fr)}
 @media(max-width:850px){.animation-grid{grid-template-columns:1fr}}

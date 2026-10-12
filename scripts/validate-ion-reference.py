@@ -33,3 +33,43 @@ for path in sys.argv[1:]:
   assert np.all(h['ion_raw_ne_sigma'][:]>0)
   assert np.any(h['ion_raw_ne'][:]<0), 'negative estimates must survive export'
   print('PASS ion matched-channel raw Ne, signed values and model centroid:',meta['id'])
+
+# Independently expand each numerical lag-profile group; do not use Rust geometry
+# or normalization constants here. Verify both partial and fully decoded gates.
+short_groups=np.flatnonzero((m['lpg_ra']>=480)&(m['lpg_ra']<911))
+rr=[];nd=[];ll=[];ww=[]
+for group in short_groups:
+ assert m['lpg_bac'][group]==0 and np.isclose(m['lpg_lag'][group]*spacing,10e-6,rtol=1e-12)
+ count=int(m['lpg_nt'][group])
+ rr.extend((m['lpg_h'][group]+np.arange(count)*m['lpg_dt'][group])*scale)
+ nd.extend([m['lpg_ND'][group]]*count)
+ ll.extend([m['lpg_wom'][group].real.max()/m['lpg_ND'][group]]*count)
+ ww.extend([m['lpg_w'][group]*scale/1000]*count)
+rr=np.array(rr);nd=np.array(nd);ll=np.array(ll)
+assert len(rr)==431
+for path in sys.argv[1:]:
+ with h5py.File(path) as h:
+  meta=json.loads(bytes(h['metadata_json'][:]))
+  d=loadmat(io.BytesIO(bz2.open(meta['source']).read()))
+  raw=d['d_data'].ravel().astype(complex);par=d['d_parbl'].ravel()
+  slices=raw[25531:31565].reshape(14,431)
+  np.testing.assert_allclose(slices.sum(axis=0),raw[480:911],rtol=2e-6,atol=2)
+  coeff=single*volume/(1.380649e-23*ap/spacing)*(r0/rr)**2*par[7]/.7
+  b=raw[:16].real.mean()/32;cal=raw[16:32].real.mean()/32
+  factor=2*par[20]/(coeff*ll*nd)
+  ne=factor*raw[480:911].real/(cal-b)
+  rho=m['vcg_Ap'][np.array([25,50,75]),0]/ap
+  nref=par[63]/2*16/(1+2*np.sum((1-np.arange(1,4)/16)*rho**2))
+  vargain=(b*b+cal*cal)/(nref+1)
+  vsum=14*slices.real.var(axis=0,ddof=1)
+  se=factor*np.sqrt(vsum/(cal-b)**2+raw[480:911].real**2*vargain/(cal-b)**4)
+  np.testing.assert_allclose(h['ion_short_raw_ne'][:],ne,rtol=4e-5,atol=1e3)
+  np.testing.assert_allclose(h['ion_short_raw_ne_sigma'][:],se,rtol=4e-5,atol=1e3)
+  np.testing.assert_allclose(h['ion_short_range_km'][:],rr/1000,rtol=1e-12)
+  np.testing.assert_allclose(h['ion_short_response_width_km'][:],ww,rtol=1e-12)
+  np.testing.assert_allclose(h['ion_short_acf'][:,0],raw[480:911].real/par[21],rtol=1e-6)
+  np.testing.assert_allclose(h['ion_short_slices'][:,:,1],slices.imag/par[21],rtol=1e-6)
+  heights=h['ion_short_altitude_km'][:]
+  assert heights[0]<48 and heights[0]>47
+  assert np.any(ne[:60]<0), 'low-gate negatives must survive'
+  print('PASS all 431 short-lag gates, sum identity, model normalization/range, signed Ne and sample uncertainty:',meta['id'], 'first altitude',heights[0])

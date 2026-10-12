@@ -147,10 +147,10 @@ including B appearing in both numerator and denominator. Systematic antenna,
 transmitter and Magic_const errors and uncertainty of the range response are not
 included in these bars. Ne and sigma are stored in m⁻³.
 
-The profile uses fixed logarithmic bounds 10⁸–10¹² m⁻³ and horizontal ±1σ bars.
+The displayed short-lag profile uses fixed logarithmic bounds 10⁸–10¹³ m⁻³ and horizontal ±1σ bars.
 Nonpositive estimates are retained and explicitly counted/marked at the axis edge;
 they are never replaced by a positive floor in the products. The temporal image
-uses a fixed signed scale and the same integration as the plasma animation.
+uses the same fixed logarithmic limits and the same integration as the plasma animation; nonpositive estimates are dark, with no change to the stored values.
 
 Altitude uses a spherical Earth radius 6370 km, site altitude 0.030 km, and
 measured elevation. This is an explicit spherical approximation, not WGS84 ray tracing.
@@ -169,10 +169,42 @@ manuscript or legacy source is redistributed with this repository.
 
 ## Partial-pulse lower boundary
 
-The zero-lag response extends well below its first centroid, but its lower edge
-is not a resolved altitude estimate. The GUI no longer relabels these centroids
-as low-altitude points. Low-altitude short-lag data require their own response
-model; they are not merged into the raw zero-lag profile.
+Schema v5 displays the **measured 10 µs ion lag**, addresses 480…910,
+rather than the broad zero-lag profile. All 431 gates are retained. The numerical
+`beataT_2init.mat` response model above gives, for zero-based gate i:
+
+- centroid `(810.5×0.4 + 10 i) µs × c/2`, first slant range 48.596 km;
+- first altitude about **47.5 km** at the measured elevation;
+- equivalent response width 2.1724 km in slant range;
+- accumulation normalization ND = `64 × min(1+floor(i/2),31)`;
+- peak real spectral response divided by ND = 156.249999713498.
+
+The first 60 samples are partial-code tails; there is no altitude cutoff at the
+fully decoded boundary. The model maps every group to calibration 16…31 and
+**no background subtraction** (`lpg_bac=0`) for these decoded nonzero lags.
+The raw-Ne conversion follows `power_prof.m`: divide by ND, calibrate in Kelvin,
+apply the monostatic radar coefficient including r², divide by the peak spectral
+response and multiply by two. It is a signed linear estimate conditional on the
+calibration. No absolute value, positive fit, lag interpolation or data-dependent
+weighting is used. Finite-lag decorrelation and Doppler can differ from zero-lag
+power; the GUI calls this a short-lag raw-Ne proxy, not an exact zero-lag estimate.
+
+Addresses 25531…31564 hold fourteen subintegrations of this same 431-gate lag.
+Their sum matches the five-second aggregate (checked against recordings).
+Estimate variance of the sum as `14 × sample_variance(slices)` and propagate
+calibration-gain uncertainty through the same conversion. This avoids treating
+spatial gradients as random noise, but is **approximate**: the online clutter
+filter can correlate subintegrations, and its missing parameter file prevents
+an exact covariance correction. Bars exclude that covariance and absolute
+calibration, spectral-model and response errors. No claim of fully unbiased
+physical density or exact uncertainty is made.
+
+HDF5 preserves complex aggregate and slice lags, signed `ion_short_raw_ne`, its
+sigma, centroid coordinates, response width, and the original broad zero-lag
+products separately. GUI time histories and profiles now use these short-lag
+products; fixed log limits are 10⁸…10¹³ m⁻³. Python validation independently
+expands every lag-profile group in the original numerical model and checks
+geometry, normalization, calibration, signs, slice sums and standard errors.
 
 ## Unresolved plasma-line validation
 

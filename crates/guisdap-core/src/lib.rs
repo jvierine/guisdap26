@@ -32,6 +32,8 @@ pub struct Products {
     pub decoded: Vec<f32>,     // band, range gate, frequency (2,90,1600)
     pub decoded_lag0: Vec<f32>, // signed short-block lag-zero diagnostic; no extrapolation
     pub ion_power: Vec<f32>,
+    pub ion_short_acf: Vec<f32>, // 431 gates, real/imag, measured 10 us lag
+    pub ion_short_slices: Vec<f32>, // 14 subintegrations, 431 gates, real/imag
     pub ion_calibration: f64,
     pub ion_excess: Vec<f32>,
     pub plasma_power: Vec<f32>,
@@ -46,6 +48,10 @@ pub fn altitude_km(range: f64, elevation: f64) -> f64 {
 }
 pub fn ion_range_km(i: usize) -> f64 {
     (1548.0 * 0.4 + 10.0 * i as f64) * 0.149896229
+}
+/// Numerical BEATA response centroid, including all partial-code tails.
+pub fn ion_short_range_km(i: usize) -> f64 {
+    (810.5 * 0.4 + 10.0 * i as f64) * 0.149896229
 }
 pub fn plasma_range_km(i: usize) -> f64 {
     (955.0 - 320.0 - 0.4 + 0.4 * i as f64) * 0.149896229
@@ -146,6 +152,14 @@ pub fn process(data: &[C], normalization: f64) -> Result<Products> {
         decoded: vec![],
         decoded_lag0: vec![],
         ion_power,
+        ion_short_acf: data[480..911]
+            .iter()
+            .flat_map(|z| [(z.re / normalization) as f32, (z.im / normalization) as f32])
+            .collect(),
+        ion_short_slices: data[25531..31565]
+            .iter()
+            .flat_map(|z| [(z.re / normalization) as f32, (z.im / normalization) as f32])
+            .collect(),
         ion_calibration: 2.0 * mean(16),
         ion_excess,
         plasma_power: vec![],
@@ -401,19 +415,8 @@ pub fn ion_raw_ne(
     let c = p.ion_calibration;
     let gain = c - b;
     ensure!(gain > 0., "non-positive calibration increment");
-    // Numerical response constants from beataT_2init.mat, SHA in docs/science.md.
-    let ap0 = 0.18370696050680618;
     let effective_length = 7851.068411222712;
-    let receiver_bandwidth = ap0 / DT;
-    let scale_m = 299792458. * DT / 2.;
-    let lambda = 299792458. / 930e6;
-    let radar_gain = 10f64.powf(4.81);
-    let electron_radius: f64 = 2.8179403262e-15;
-    // 0.7 is the documented calibration multiplier in this event's GUISDAP run.
-    let radar =
-        electron_radius.powi(2) * radar_gain * lambda * lambda * 0.460 * 0.66 * scale_m * tx_w
-            / 0.7
-            / (4. * std::f64::consts::PI * 1.380649e-23 * receiver_bandwidth);
+    let radar = ion_radar_factor(tx_w);
     // Sixteen background/calibration range samples, half the pulses in each.
     // Account for covariance between samples caused by the receiver filter.
     let corr = [
@@ -489,5 +492,112 @@ mod power_tests {
         let (ne, _) = ion_raw_ne(&p, 177.8, 1.2e6, 896.).unwrap();
         assert!(ne[0] < 0.);
         assert_eq!(ne[1], 0.);
+    }
+}
+
+/// Monostatic radar coefficient multiplied by range squared.
+fn ion_radar_factor(tx_w: f64) -> f64 {
+    // Numerical response constants from beataT_2init.mat, SHA in docs/science.md.
+    let ap0 = 0.18370696050680618;
+    let receiver_bandwidth = ap0 / DT;
+    let scale_m = 299792458. * DT / 2.;
+    let lambda = 299792458. / 930e6;
+    let radar_gain = 10f64.powf(4.81);
+    let electron_radius: f64 = 2.8179403262e-15;
+    // 0.7 is the documented calibration multiplier in this event's GUISDAP run.
+    electron_radius.powi(2) * radar_gain * lambda * lambda * 0.460 * 0.66 * scale_m * tx_w
+        / 0.7
+        / (4. * std::f64::consts::PI * 1.380649e-23 * receiver_bandwidth)
+}
+
+/// Signed 10-us raw-Ne equivalent using GUISDAP's peak spectral response.
+/// Linear in measured lag conditional on calibration. This is not a measured
+/// zero lag: decorrelation/Doppler and the absolute calibration remain model errors.
+pub fn ion_short_raw_ne(
+    p: &Products,
+    cal_k: f64,
+    tx_w: f64,
+    pulses: f64,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    ensure!(
+        cal_k > 0. && tx_w > 0. && pulses > 1.,
+        "invalid ion calibration metadata"
+    );
+    ensure!(
+        p.ion_short_acf.len() == 862 && p.ion_short_slices.len() == 14 * 862,
+        "invalid ion short-lag dimensions"
+    );
+    let b = p.background[0];
+    let c = p.ion_calibration;
+    let gain = c - b;
+    ensure!(gain > 0., "non-positive calibration increment");
+    let rho = [
+        0.18246371104456985f64,
+        0.0005802602186175348,
+        1.2516622566827527e-10,
+    ];
+    let corr = 1.
+        + 2. * rho
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (1. - (i + 1) as f64 / 16.) * r * r)
+            .sum::<f64>();
+    let nref = pulses / 2. * 16. / corr;
+    let gain_var = (b * b + c * c) / (nref + 1.);
+    let radar = ion_radar_factor(tx_w);
+    let mut ne = Vec::with_capacity(431);
+    let mut sigma = Vec::with_capacity(431);
+    for i in 0..431 {
+        // lpg_ND = 64 * min(1 + floor(gate/2), 31). Calibration
+        // references above have already been put on the ND=64 scale.
+        let code_pairs = (i / 2 + 1).min(31) as f64;
+        let value = p.ion_short_acf[2 * i] as f64;
+        let slices: Vec<f64> = (0..14)
+            .map(|j| p.ion_short_slices[(j * 431 + i) * 2] as f64)
+            .collect();
+        let mean = slices.iter().sum::<f64>() / 14.;
+        // Variance of the SUM, not the mean. Approximate: online clutter
+        // filtering may correlate subintegrations; no covariance is invented.
+        let var_sum = 14. / 13. * slices.iter().map(|x| (x - mean).powi(2)).sum::<f64>();
+        let r = ion_short_range_km(i) * 1000.;
+        let factor = 2. * cal_k * r * r / (radar * 156.249999713498 * code_pairs);
+        // lpg_bac=0 for this decoded nonzero lag: do not subtract raw noise.
+        ne.push((factor * value / gain) as f32);
+        sigma.push(
+            (factor * (var_sum / gain.powi(2) + value * value * gain_var / gain.powi(4)).sqrt())
+                as f32,
+        );
+    }
+    Ok((ne, sigma))
+}
+
+#[cfg(test)]
+mod short_power_tests {
+    use super::*;
+    #[test]
+    fn partial_gate_normalization_signed_sum_and_uncertainty() {
+        let mut d = vec![C::new(1., 0.); 196493];
+        d[16..32].fill(C::new(2., 0.));
+        for i in 0..431 {
+            let pairs = (i / 2 + 1).min(31) as f64;
+            let scale = pairs / ion_short_range_km(i).powi(2);
+            for j in 0..14 {
+                d[25531 + j * 431 + i] = C::new((j as f64 - 6.) * scale, 0.);
+            }
+            d[480 + i] = (0..14).map(|j| d[25531 + j * 431 + i]).sum();
+        }
+        let mut p = process(&d, 1.).unwrap();
+        let (ne, se) = ion_short_raw_ne(&p, 177.8, 1.2e6, 896.).unwrap();
+        for v in &ne {
+            assert!((*v / ne[0] - 1.).abs() < 1e-6);
+        }
+        assert!(se.iter().all(|v| *v > 0.));
+        let h = altitude_km(ion_short_range_km(0), 77.8);
+        assert!(h > 47. && h < 48.);
+        p.ion_short_acf[0] *= -1.;
+        p.ion_short_acf[2] = 0.;
+        let (signed, _) = ion_short_raw_ne(&p, 177.8, 1.2e6, 896.).unwrap();
+        assert_eq!(signed[0], -ne[0]);
+        assert_eq!(signed[1], 0.);
     }
 }

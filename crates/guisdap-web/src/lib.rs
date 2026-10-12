@@ -166,7 +166,7 @@ fn draw(
         &gl,
         Gl::FRAGMENT_SHADER,
         r#"#version 300 es
- precision highp float;in vec2 uv;out vec4 color;uniform sampler2D field;uniform float lim;uniform float cursor;uniform float positive;
+ precision highp float;in vec2 uv;out vec4 color;uniform sampler2D field;uniform float lim;uniform float cursor;uniform float positive;uniform float logpower;
  const vec3 palette[16]=vec3[16](
 vec3(0.050383,0.029803,0.527975),
 vec3(0.200445,0.017902,0.593364),
@@ -187,8 +187,9 @@ vec3(0.940015,0.975158,0.131326));
  void main(){float raw=texture(field,uv).r;
  float z=raw/lim*8.0;float q=sign(z)*log(abs(z)+sqrt(z*z+1.0))/2.77647;
  float t=clamp(positive>0.5?q:0.5+0.5*q,0.0,1.0);
+ if(logpower>0.5)t=clamp((log(max(raw,1e8))/log(10.0)-8.0)/5.0,0.0,1.0);
  float pos=t*15.0;int j=min(int(floor(pos)),14);vec3 c=mix(palette[j],palette[j+1],pos-float(j));
- if(isnan(raw))c=vec3(.035,.070,.10);
+ if(isnan(raw)||(logpower>0.5&&raw<=0.0))c=vec3(.035,.070,.10);
  if(cursor>=0.0&&abs(uv.x-cursor)<.0014)c=mix(c,vec3(1.,1.,1.),.75);color=vec4(c,1.);}
  "#,
     )?;
@@ -229,6 +230,10 @@ vec3(0.940015,0.975158,0.131326));
     let limit = fixed_limit.unwrap_or_else(|| percentile(v, p));
     gl.uniform1f(gl.get_uniform_location(&program, "lim").as_ref(), limit);
     gl.uniform1f(
+        gl.get_uniform_location(&program, "logpower").as_ref(),
+        if id == "power" { 1. } else { 0. },
+    );
+    gl.uniform1f(
         gl.get_uniform_location(&program, "positive").as_ref(),
         if positive { 1. } else { 0. },
     );
@@ -244,6 +249,10 @@ vec3(0.940015,0.975158,0.131326));
     gl.delete_shader(Some(&frag));
     if gl.get_error() != Gl::NO_ERROR {
         return Err(error(format!("WebGL rendering error: {id}")));
+    }
+    if id == "power" {
+        el("power-scale").set_inner_html("<span>10⁸</span><span class='colorbar' aria-label='Plasma color scale'></span><span>10¹³ m⁻³</span><span>log · fixed; dark = nonpositive</span>");
+        return Ok(());
     }
     let low = if positive { 0. } else { -limit };
     let units = if id == "power" {
@@ -333,7 +342,7 @@ fn overview(a: &App) -> Result<(), JsValue> {
         indices.len(),
         a.percentile,
         cursor,
-        (Some(1e11), false),
+        (Some(1e13), true),
     )?;
     let low = altitude(a.m.ion_range_km[indices[0]] - shift, elevation);
     let high = altitude(
@@ -341,9 +350,9 @@ fn overview(a: &App) -> Result<(), JsValue> {
         elevation,
     );
     text("power-axis-label", "Response-centroid altitude / km");
-    text("power-axis-caption", "Signed raw Ne / m⁻³ versus UTC");
+    text("power-axis-caption", "10 µs lag raw Ne / m⁻³ versus UTC");
     let r0 = a.m.ion_range_km[0];
-    let half = 95.90584644 / 2.;
+    let half = 2.1724186 / 2.;
     text(
         "power-support",
         &format!(
@@ -373,9 +382,9 @@ fn profile(a: &App, indices: &[usize]) {
     let n = a.m.frames.len();
     let f = &a.m.frames[a.selected];
     // Fixed log bounds across every integration; never rectify stored estimates.
-    let x = |v: f64| 52. + (v.max(1e8).log10().clamp(8., 12.) - 8.) * 70.;
+    let x = |v: f64| 52. + (v.max(1e8).log10().clamp(8., 13.) - 8.) * 56.;
     let y = |h: f64| 310. - (h - 40.) / 360. * 280.;
-    let mut svg=String::from("<svg viewBox='0 0 360 360' role='img' aria-label='Signed zero-lag raw electron density versus response-centroid altitude, logarithmic scale 10^8 to 10^12 per cubic metre, with one sigma uncertainty'><g font-family='monospace' font-size='10' fill='#8b9aa8'>");
+    let mut svg=String::from("<svg viewBox='0 0 360 360' role='img' aria-label='Signed 10 microsecond lag raw electron density versus response-centroid altitude, logarithmic scale 10^8 to 10^13 per cubic metre, with one sigma uncertainty'><g font-family='monospace' font-size='10' fill='#8b9aa8'>");
     for h in (40..=400).step_by(10) {
         let yy = y(h as f64);
         if h % 50 == 0 {
@@ -387,7 +396,7 @@ fn profile(a: &App, indices: &[usize]) {
             svg += &format!("<path d='M46 {yy} H52' stroke='#72878e'/>");
         }
     }
-    for exp in 8..=12 {
+    for exp in 8..=13 {
         let xx = x(10f64.powi(exp));
         svg+=&format!("<path d='M{xx} 30 V310' stroke='#293743'/><text x='{xx}' y='332' text-anchor='middle'>10^{exp}</text>");
     }
@@ -400,13 +409,13 @@ fn profile(a: &App, indices: &[usize]) {
         let yy = y(altitude(a.m.ion_range_km[i], f.elevation_deg));
         let lo = v - se;
         let hi = v + se;
-        if hi > 1e8 && lo < 1e12 {
+        if hi > 1e8 && lo < 1e13 {
             svg+=&format!("<path d='M{} {yy:.2} H{}' stroke='#80dfce' stroke-opacity='.35'><title>Raw Ne {v:.3e} ± {se:.3e} m⁻³ (1σ)</title></path>",x(lo),x(hi));
         }
         if v <= 0. {
             nonpositive += 1;
         }
-        if !(1e8..=1e12).contains(&v) {
+        if !(1e8..=1e13).contains(&v) {
             connected = false;
             let xx = if v < 1e8 { 52. } else { 332. };
             svg+=&format!("<path d='M{xx} {yy:.2} l4 -2 v4 z' fill='#e8ac69'><title>Outside logarithmic display: {v:.3e} ± {se:.3e} m⁻³</title></path>");
@@ -414,11 +423,12 @@ fn profile(a: &App, indices: &[usize]) {
             let op = if connected { "L" } else { "M" };
             path += &format!("{op}{:.2} {yy:.2} ", x(v));
             connected = true;
+            svg += &format!("<circle cx='{}' cy='{yy:.2}' r='1.3' fill='#80dfce'><title>Raw Ne {v:.3e} ± {se:.3e} m⁻³</title></circle>", x(v));
         }
     }
     svg+=&format!("<path d='{path}' stroke='#80dfce' fill='none' stroke-width='1.4'/><text x='190' y='352' text-anchor='middle'>Raw Ne / m⁻³ · log scale</text></g></svg>");
     el("profile").set_inner_html(&svg);
-    text("power-uncertainty",&format!("Horizontal bars: ±1σ statistical uncertainty. {nonpositive} nonpositive estimates in the displayed altitude interval; edge markers show values outside the log axis. Signed estimates remain in HDF5."));
+    text("power-uncertainty",&format!("Horizontal bars: approximate ±1σ from 14 short integrations plus calibration. Clutter-induced covariance and systematic errors are not included. {nonpositive} nonpositive estimates in the displayed altitude interval; edge markers show values outside the log axis. Signed estimates remain in HDF5."));
 }
 fn decoded(a: &mut App) -> Result<(), JsValue> {
     if a.decoded_selected != Some(a.selected) {
@@ -597,22 +607,22 @@ pub async fn start() -> Result<(), JsValue> {
         cfg.data_root + "/"
     };
     let m: Manifest = json(&(root.clone() + "index.json")).await?;
-    if m.schema != "beata22-quicklook-v4"
+    if m.schema != "beata22-quicklook-v5"
         || m.frames.is_empty()
-        || m.ion_range_km.len() != 432
+        || m.ion_range_km.len() != 431
         || m.decoded_range_km.len() != 90
     {
         return Err(error("unsupported or empty dataset"));
     }
     let broad = floats(&(root.clone() + "broad-excess.f32")).await?;
     let raw = floats(&(root.clone() + "broad-raw.f32")).await?;
-    let power = floats(&(root.clone() + "ion-raw-ne.f32")).await?;
-    let power_sigma = floats(&(root.clone() + "ion-raw-ne-sigma.f32")).await?;
+    let power = floats(&(root.clone() + "ion-short-raw-ne.f32")).await?;
+    let power_sigma = floats(&(root.clone() + "ion-short-raw-ne-sigma.f32")).await?;
     let n = m.frames.len();
     if broad.len() != 800 * n
         || raw.len() != 800 * n
-        || power.len() != 432 * n
-        || power_sigma.len() != 432 * n
+        || power.len() != 431 * n
+        || power_sigma.len() != 431 * n
     {
         return Err(error("invalid overview dimensions"));
     }

@@ -2,10 +2,10 @@
 
 Rust compute and a Rust/WebAssembly/WebGL2 viewer for incoherent-scatter radar data.
 The first vertical slice processes Tromsø UHF **BEATA 2.2, 2022-11-02,
-17:00–17:15 UTC**: two plasma-line bands and zero-lag power versus altitude.
+17:00–17:15 UTC**: two plasma-line bands and ion-line short-lag power versus altitude.
 
 This is a research quick-look implementation, not yet a replacement for full
-GUISDAP inference. It estimates signed zero-lag raw Ne with statistical error bars;
+GUISDAP inference. It displays signed 10 µs lag raw-Ne equivalents down to about 47.5 km, with approximate statistical error bars;
 it does not fit true electron density, temperature, or velocity.
 The equations, range responses and limitations are in [docs/science.md](docs/science.md).
 
@@ -27,8 +27,8 @@ cargo build --release -p guisdap-worker
 cargo test -p guisdap-core -p guisdap-worker
 target/release/guisdap-worker analyze --config config/avaruus.json
 target/release/guisdap-worker export \
-  --input ~/data/guisdap/2022-11-02-v4 \
-  --output web/data/2022-11-02-v4
+  --input ~/data/guisdap/2022-11-02-v5 \
+  --output web/data/2022-11-02-v5
 ```
 
 `inspect <file.mat.bz2>` prints the observed identity, timing, tuning and dimensions.
@@ -64,7 +64,7 @@ No TypeScript or frontend package manager is required.
 
 The viewer includes raw/temporal-background-subtracted broad-gate spectrograms,
 a time selector and animation controls, a merged altitude–frequency view, and a
-zero-lag power time–altitude view with a synchronized signed profile.
+short-lag raw-Ne time–altitude view with a synchronized signed profile (fixed 10⁸–10¹³ m⁻³ limits).
 Browser color limits are diagnostic stretches, not calibration; the animation
 uses a fixed scale. All 800 measured long lags enter the direct FFT.
 
@@ -94,8 +94,7 @@ add calibration and uncertainty propagation; assess interference and transmitter
 artifacts; then implement plasma-line detection and fitting with explicit quality
 flags. The raw zero-lag pulse response is approximately 96 km in slant range and must
 not be mistaken for the 3 km decoded range response. The selected plasma spectra have five-second integrations. The recording also
-contains fourteen ion short-lag slices per integration; those faster products
-need a separate response model and are not yet exposed by this viewer.
+contains fourteen ion short-lag slices per integration; v5 preserves these in HDF5 and uses their scatter for the approximate uncertainty of the five-second profile.
 
 
 The current browser merges both receivers, animates integrations, and aligns

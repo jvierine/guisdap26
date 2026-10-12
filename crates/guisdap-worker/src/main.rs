@@ -13,7 +13,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-const SCHEMA: &str = "beata22-quicklook-v4";
+const SCHEMA: &str = "beata22-quicklook-v5";
 #[derive(Parser)]
 #[command(version, about = "Rust BEATA 2.2 plasma-line quick-look processor")]
 struct Args {
@@ -225,6 +225,29 @@ fn write_frame(dir: &Path, meta: &FrameMeta, p: &core::Products, par: &[f64]) ->
             &p.decoded_lag0,
             "signed short-block diagnostic / normalization / (31/3); no extrapolation",
         )?;
+        let (short_ne, short_se) = core::ion_short_raw_ne(p, par[20], meta.transmitter_w, par[63])?;
+        dataset(
+            &f,
+            "ion_short_acf",
+            &[431, 2],
+            &p.ion_short_acf,
+            "accumulator / normalization; measured 10 us lag; real,imag",
+        )?;
+        dataset(
+            &f,
+            "ion_short_slices",
+            &[14, 431, 2],
+            &p.ion_short_slices,
+            "accumulator / normalization; fourteen subintegrations; measured 10 us lag; real,imag",
+        )?;
+        dataset(&f, "ion_short_raw_ne", &[431], &short_ne, "m^-3; signed 10 us lag raw-Ne equivalent; peak spectral response; Te/Ti=1; no Debye correction")?;
+        dataset(&f, "ion_short_raw_ne_sigma", &[431], &short_se, "m^-3; approximate 1-sigma from fourteen subintegrations and calibration; excludes inter-slice covariance and systematic errors")?;
+        f.new_dataset_builder()
+            .with_data(&[10e-6f64])
+            .create("ion_short_lag_s")?;
+        f.new_dataset_builder()
+            .with_data(&vec![36.23203814516196 * 0.4 * 0.149896229; 431])
+            .create("ion_short_response_width_km")?;
         let (ne, se) = core::ion_raw_ne(p, par[20], meta.transmitter_w, par[63])?;
         dataset(
             &f,
@@ -273,6 +296,7 @@ fn write_frame(dir: &Path, meta: &FrameMeta, p: &core::Products, par: &[f64]) ->
         )?;
         for (name, n, range) in [
             ("ion", 432, core::ion_range_km as fn(usize) -> f64),
+            ("ion_short", 431, core::ion_short_range_km),
             ("plasma", 5450, core::plasma_range_km),
             ("decoded", 90, core::decoded_range_km),
         ] {
@@ -458,20 +482,22 @@ fn export(input: &Path, output: &Path) -> Result<()> {
     let n = frames.len();
     let mut broad = vec![0f32; 800 * n];
     let mut ion = vec![0f32; 432 * n];
-    let mut ion_ne = vec![0f32; 432 * n];
-    let mut ion_se = vec![0f32; 432 * n];
+    let mut ion_ne = vec![0f32; 431 * n];
+    let mut ion_se = vec![0f32; 431 * n];
     let mut index = vec![];
     for (t, (m, path)) in frames.iter().enumerate() {
         let f = hdf5::File::open(path)?;
         let sp = f.dataset("broad_spectrum")?.read_raw::<f32>()?;
         let power = f.dataset("ion_excess")?.read_raw::<f32>()?;
-        let ne = f.dataset("ion_raw_ne")?.read_raw::<f32>()?;
-        let se = f.dataset("ion_raw_ne_sigma")?.read_raw::<f32>()?;
+        let ne = f.dataset("ion_short_raw_ne")?.read_raw::<f32>()?;
+        let se = f.dataset("ion_short_raw_ne_sigma")?.read_raw::<f32>()?;
         for i in 0..800 {
             broad[i * n + t] = sp[i];
         }
         for i in 0..432 {
             ion[i * n + t] = power[i];
+        }
+        for i in 0..431 {
             ion_ne[i * n + t] = ne[i];
             ion_se[i * n + t] = se[i];
         }
@@ -514,19 +540,20 @@ fn export(input: &Path, output: &Path) -> Result<()> {
     }
     binary(&output.join("broad-excess.f32"), &broad)?;
     binary(&output.join("ion-power.f32"), &ion)?;
-    binary(&output.join("ion-raw-ne.f32"), &ion_ne)?;
-    binary(&output.join("ion-raw-ne-sigma.f32"), &ion_se)?;
+    binary(&output.join("ion-short-raw-ne.f32"), &ion_ne)?;
+    binary(&output.join("ion-short-raw-ne-sigma.f32"), &ion_se)?;
     let first = &frames[0].0;
     let manifest = serde_json::json!({"schema":SCHEMA,"title":"BEATA · 2 November 2022","frames":index,
-        "native_uncoded_shape":[2,50,4,2],"native_long_shape":[2,800,90,2],"native_short_shape":[2,50,91,2],"decoded_shape":[2,90,core::NFFT],"broad_shape":[2,4,100,n],"ion_shape":[432,n],
-        "ion_profile":{"signal_offset":48,"background_offset":0,"calibration_offset":16,"response_width_slant_km":95.90584644,"scale":"signed raw Ne, Te/Ti=1, no Debye correction","magic_constant":0.7,"antenna_efficiency":0.66,"uncertainty":"1-sigma six-gate range-normalized local scatter (GUISDAP var_prof approach), receiver covariance and calibration-sample propagation; spatial gradients can inflate errors; excludes systematic calibration and response/model errors"},
+        "native_uncoded_shape":[2,50,4,2],"native_long_shape":[2,800,90,2],"native_short_shape":[2,50,91,2],"decoded_shape":[2,90,core::NFFT],"broad_shape":[2,4,100,n],"ion_shape":[431,n],"ion_zero_lag_shape":[432,n],
+        "ion_profile":{"signal_offset":480,"gates":431,"lag_s":10e-6,"slice_offset":25531,"slices":14,"background_subtracted":false,"calibration_offset":16,"response_width_slant_km":2.1724186,"scale":"signed 10 us lag raw-Ne equivalent; peak spectral response, Te/Ti=1, no Debye correction","magic_constant":0.7,"antenna_efficiency":0.66,"uncertainty":"approximate 1-sigma scatter of fourteen subintegrations plus calibration-sample propagation; online clutter can correlate slices; excludes that covariance, decorrelation/Doppler and systematic calibration errors"},
         "lag_block_roles":{"native_long":"decoded altitude spectrum, lags 1..800", "native_short":"decoded short-lag diagnostic, distinct range response", "native_uncoded":"four overlapping broad gates; diagnostic/calibration only; excluded from altitude spectrum"},
         "decoded_fft_length":core::NFFT,"sample_interval_s":core::DT,"broad_range_bounds_km":[[47,221],[128,302],[209,383],[290,464]],
-        "ion_range_km":(0..432).map(core::ion_range_km).collect::<Vec<_>>(),
+        "ion_zero_lag_range_km":(0..432).map(core::ion_range_km).collect::<Vec<_>>(),
+        "ion_range_km":(0..431).map(core::ion_short_range_km).collect::<Vec<_>>(),
         "decoded_range_km":(0..90).map(core::decoded_range_km).collect::<Vec<_>>(),
         "plasma_range_km":(0..5450).map(core::plasma_range_km).collect::<Vec<_>>(),
         "nominal_elevation_deg":first.elevation_deg,
-        "notes":"Quick-look relative spectra, not calibrated density. Decoded lower 12 gates are partial-code tails. Raw zero-lag power has ~96 km pulse response. Temporal median subtraction can remove persistent plasma lines; inspect raw view too."});
+        "notes":"Quick-look relative spectra, not calibrated density. Decoded lower 12 gates are partial-code tails. The displayed ion profile uses measured 10 us lags down to ~47.5 km; broad zero-lag data remain in HDF5. Temporal median subtraction can remove persistent plasma lines; inspect raw view too."});
     // Manifest is the commit marker, published after every referenced object.
     atomic_bytes(&output.join("index.json"), &serde_json::to_vec(&manifest)?)?;
     println!("Exported {n} frames to {}", output.display());
