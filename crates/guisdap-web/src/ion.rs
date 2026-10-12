@@ -576,6 +576,8 @@ fn acf(v: &Viewer, component: usize) -> String {
     s
 }
 fn render(v: &Viewer) {
+    text("fit-uncertainty", &v.data.uncertainty);
+    text("fit-assumptions", &v.data.limitations.join(". "));
     text("fit-calibration-used",&v.data.calibration.as_ref().map(|c|format!("Magic constant used: {:.4} · antenna efficiency: {:.3} · these values produced the displayed fits; plasma-line calibration estimates are not automatically applied.",c.magic_constant,c.antenna_efficiency)).unwrap_or_else(||"Magic constant used: not recorded in this product.".into()));
     instruments::render(v);
     let p = selected(v);
@@ -1005,8 +1007,6 @@ pub async fn start_ion() -> Result<(), JsValue> {
     if data.schema != "beata22-ionfit-v2" || data.profiles.is_empty() {
         return Err(error("unsupported or empty ion product"));
     }
-    text("fit-uncertainty", &data.uncertainty);
-    text("fit-assumptions", &data.limitations.join(". "));
     el("fit-resolution").set_inner_html(
         &location
             .datasets
