@@ -539,13 +539,19 @@ pub async fn start_ion() -> Result<(), JsValue> {
     el("fit-gate").set_inner_html(&options);
     let slider: HtmlInputElement = el("fit-slider").dyn_into()?;
     slider.set_max(&(data.profiles.len() - 1).to_string());
-    slider.set_value("5");
     let gate = data.profiles[0]
         .gates
         .iter()
         .position(|g| g.altitude_km >= 200.)
         .unwrap_or(0);
-    let time = 5.min(data.profiles.len() - 1);
+    // Keep the initial event time near 17:05 regardless of integration cadence.
+    let target = data.profiles[0].start_unix + 300.;
+    let time = data
+        .profiles
+        .iter()
+        .position(|p| p.end_unix > target)
+        .unwrap_or(data.profiles.len() - 1);
+    slider.set_value(&time.to_string());
     let selector: HtmlSelectElement = el("fit-gate").dyn_into()?;
     selector.set_value(&gate.to_string());
     let upper = data.profiles[0].gates.len() - 1;

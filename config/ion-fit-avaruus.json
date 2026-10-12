@@ -1,9 +1,9 @@
 {
  "quicklook_frames":"/home/j/data/guisdap/2022-11-02-v5/frames",
  "experiment_model":"legacy/guisdap9/exps/beata/beataT_2init.mat",
- "output":"/home/j/data/guisdap/2022-11-02-ionfit-v1",
- "export":"web/data/2022-11-02-ionfit-v1",
- "integration_s":60,
+ "output":"/home/j/data/guisdap/2022-11-02-ionfit-15s-v1",
+ "export":"web/data/2022-11-02-ionfit-15s-v1",
+ "integration_s":15,
  "altitude_edges_km":[47,57,67,77,87,97,107,117,127,137,147,157,167,177,187,197,217,237,257,277,297,317,337,357,377,397,417,437,457,477,497,517,537,557,577,597,617,637,657,677,697],
  "composition_transition_km":180,
  "composition_scale_km":20,

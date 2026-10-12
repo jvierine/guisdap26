@@ -22,7 +22,11 @@ reader verifies each original recording against its product hash. The Rust
 is executed or redistributed. Unsupported model hashes and incomplete/overlapping
 address maps fail explicitly.
 
-The first run covers 17:00–17:15 UTC on 2022-11-02 in fifteen 60-second windows.
+The default run covers 17:00–17:15 UTC on 2022-11-02 in sixty independent
+15-second windows, each containing three native five-second records. This is
+four times the original cadence. The original fifteen 60-second products remain
+available; `config/ion-fit-avaruus-60s.json` reproduces that integration.
+The 15-second product is stored separately as `2022-11-02-ionfit-15s-v1`.
 Altitude bins begin at 47 km. No low-altitude or low-SNR data are silently removed.
 The grid uses 10 km bins below 197 km and 20 km bins above, ending at 697 km.
 Every available decoded ion lag (10–410 microseconds, addresses 480–25530)
@@ -92,13 +96,17 @@ successful unconstrained measurement.
 
 Each five-second record is calibrated and averaged within each response group
 separately. Temporal variance of these group averages provides the weighting
-variance of the 60-second mean. The final parameter covariance is a temporal
+variance of the integration mean. The final parameter covariance is a temporal
 cluster sandwich estimate: correlations between lags and range averages within
 a record are included. Its diagonal is increased to the conditional diagonal
-variance when the latter is larger. Both error estimates are saved. The 12
-records are assumed independent; their temporal correlation, instrument systematics,
+variance when the latter is larger. Both error estimates are saved. The three
+records per 15-second window (12 for a 60-second window) are assumed independent; their temporal correlation, instrument systematics,
 and composition uncertainty remain unaccounted for. Actual time variation within
-a minute increases the empirical errors and can invalidate a stationary model.
+an integration increases the empirical errors and can invalidate a stationary model.
+With only three records, the estimated variances and covariance are less stable;
+quality flags and uncertainty bands remain essential. The current estimator
+requires at least three records, so 15 seconds is its shortest supported
+integration; five-second fits require a separate within-record noise model.
 
 The diagonal weighted residual sum divided by nominal degrees of freedom is
 saved as `reduced_chi_square`, but is displayed as **weighted residual score**.

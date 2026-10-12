@@ -31,6 +31,46 @@ fn main() -> Result<()> {
         }
         println!("PASS existing fit results unchanged");
     }
+    let integration_s = data["config"]["integration_s"].as_f64().unwrap();
+    let mut source_hashes = std::collections::BTreeSet::new();
+    for p in profiles {
+        let sources = p["sources"].as_array().unwrap();
+        ensure!(
+            sources.len() >= 3 && sources.len() == p["source_count"].as_u64().unwrap() as usize,
+            "source count mismatch"
+        );
+        let start = p["start_unix"].as_f64().unwrap();
+        let end = p["end_unix"].as_f64().unwrap();
+        ensure!(
+            (end - start - integration_s).abs() < 0.01,
+            "wrong integration duration"
+        );
+        for source in sources {
+            ensure!(
+                source_hashes.insert(source["source_sha256"].as_str().unwrap()),
+                "source reused between profiles"
+            );
+            ensure!(
+                source["start_unix"].as_f64().unwrap() >= start - 0.01
+                    && source["end_unix"].as_f64().unwrap() <= end + 0.01,
+                "source outside integration"
+            );
+        }
+    }
+    for pair in profiles.windows(2) {
+        ensure!(
+            (pair[1]["start_unix"].as_f64().unwrap()
+                - pair[0]["start_unix"].as_f64().unwrap()
+                - integration_s)
+                .abs()
+                < 0.01,
+            "unexpected cadence or missing profile"
+        );
+    }
+    println!(
+        "PASS {integration_s}-second cadence, {} unique source records",
+        source_hashes.len()
+    );
     let mut counts = BTreeMap::new();
     for (i, p) in profiles.iter().enumerate() {
         let gates = p["gates"].as_array().unwrap();
