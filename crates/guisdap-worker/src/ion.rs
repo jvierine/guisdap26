@@ -1,5 +1,6 @@
 //! BEATA ion fitting orchestration. Legacy numerical responses are read as data,
 //! never executed. Each observation owns its calibration and each job its state.
+mod atmosphere;
 mod stream;
 use super::{load, metadata};
 use anyhow::{ensure, Context, Result};
@@ -21,6 +22,8 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub atmosphere: Option<atmosphere::AtmosphereConfig>,
     pub quicklook_frames: PathBuf,
     pub experiment_model: PathBuf,
     pub output: PathBuf,
@@ -77,6 +80,8 @@ struct Record {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Gate {
+    #[serde(default)]
+    pub prescribed_atmosphere: Option<atmosphere::Prescribed>,
     pub altitude_km: f64,
     pub lower_km: f64,
     pub upper_km: f64,
@@ -279,8 +284,21 @@ fn fit_gate(
         (lo, hi)
     };
     let altitude = (lo + hi) / 2.;
-    let oxygen =
-        1. / (1. + (-(altitude - cfg.composition_transition_km) / cfg.composition_scale_km).exp());
+    let atmosphere = cfg
+        .atmosphere
+        .as_ref()
+        .context("prescribed MSIS/IRI atmosphere configuration required")?;
+    ensure!(
+        cfg.model_selection_below_km.is_none(),
+        "model selection must not override prescribed collisions/composition"
+    );
+    let unix = records
+        .iter()
+        .map(|r| (r.meta.start_unix + r.meta.end_unix) / 2.)
+        .sum::<f64>()
+        / records.len() as f64;
+    let prescribed = atmosphere.evaluate(unix, altitude)?;
+    let oxygen = 1. - prescribed.molecular_fraction;
     let model = SpectrumModel {
         radar_frequency_hz: exp.radar_hz,
         ions: vec![
@@ -298,8 +316,8 @@ fn fit_gate(
     let settings = FitSettings {
         max_iterations: 160,
         tie_electron_ion_temperature: altitude < cfg.tie_temperature_below_km,
-        fit_collision_rate: altitude < cfg.fit_collisions_below_km,
-        ..Default::default()
+        fit_collision_rate: false,
+        fixed_collision_s: prescribed.collision_s,
     };
     let mut measurements = vec![];
     let mut addresses = vec![];
@@ -365,6 +383,7 @@ fn fit_gate(
         maxwidth = maxwidth.max(g.width_km);
     }
     let mut gate = Gate {
+        prescribed_atmosphere: Some(prescribed),
         altitude_km: altitude,
         lower_km: lo,
         upper_km: hi,
@@ -527,6 +546,14 @@ fn fit_gate(
 }
 pub fn run(path: &Path) -> Result<()> {
     let cfg: Config = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        cfg.atmosphere.is_some(),
+        "atmosphere configuration is required: prescribed Rust MSIS collisions and IRI composition"
+    );
+    ensure!(
+        cfg.fit_collisions_below_km == 0. && cfg.model_selection_below_km.is_none(),
+        "free collision fitting and model selection are disabled for prescribed atmosphere runs"
+    );
     if cfg.streaming {
         return stream::run(&cfg);
     }

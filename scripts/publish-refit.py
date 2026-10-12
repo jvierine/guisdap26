@@ -13,10 +13,14 @@ if phase == "running":
     if existing is None:
         cfg["datasets"].append(dict(label=label + " · refitting", integration_s=int(cadence), data_url=url))
 else:
-    cfg["datasets"] = [d for d in cfg["datasets"] if d["data_url"] != url]
+    cfg["datasets"] = [d for d in cfg["datasets"] if not (d["data_url"] == url and d["label"] != label)]
+    if not any(d["label"] == label for d in cfg["datasets"]):
+        cfg["datasets"].append(dict(label=label, integration_s=int(cadence), data_url=url))
     for d in cfg["datasets"]:
         if d["label"] == label:
             d["data_url"] = url
+order = ["15 seconds","1 minute","15 seconds · native gates below 250 km","1 minute · native gates below 250 km"]
+cfg["datasets"].sort(key=lambda d: order.index(d["label"]) if d["label"] in order else 9)
 for out in [path, Path("/srv/guisdap/ion-config.json")]:
     temp = out.with_suffix(".json.tmp")
     temp.write_text(json.dumps(cfg, indent=2)); os.replace(temp, out)

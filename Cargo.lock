@@ -545,6 +545,7 @@ dependencies = [
  "hdf5-metno",
  "matfile",
  "rayon",
+ "rmsis",
  "serde",
  "serde_json",
  "sha2",
@@ -984,6 +985,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-dual"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f34ea78002ef6a6369e7d9deee0fd51c2ea398de7c3a4e5da78f954e2f41e1c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1198,6 +1208,15 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "rmsis"
+version = "0.1.0"
+source = "git+https://github.com/jvierine/rmsis?rev=fc707387617885de749dcc516c306a74227cf1b5#fc707387617885de749dcc516c306a74227cf1b5"
+dependencies = [
+ "num-dual",
+ "num-traits",
+]
 
 [[package]]
 name = "rustfft"

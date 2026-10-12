@@ -26,6 +26,7 @@ struct SeedFit {
 fn blank(cfg: &Config, lo: f64, hi: f64, status: &str) -> Gate {
     let h = (lo + hi) / 2.;
     Gate {
+        prescribed_atmosphere: None,
         altitude_km: h,
         lower_km: lo,
         upper_km: hi,
@@ -171,15 +172,17 @@ fn publish(cfg: &Config, profiles: &[Value], phase: &str, started: i64) -> Resul
         "limitations":["Maxwellian local homogeneous fit; fixed altitude-dependent ion composition", "All native decoded ion lags retained; no spline filling or SVD", "Raw Ne panel uses signed 10 microsecond lag, range-squared correction, Te/Ti=1 and peak spectral response; not fitted density or zero lag", "Missing-record intervals are explicit; no temporal interpolation"],
         "processing":{"phase":phase,"threads":cfg.threads,"total":profiles.len(),"completed":completed,"failed":failed,"insufficient":insufficient,"source_records":profiles.iter().map(|p|p["source_count"].as_u64().unwrap_or(0)).sum::<u64>(),"started_unix":started,"updated_unix":chrono::Utc::now().timestamp()},
         "profiles":profiles});
-    document["composition"] = json!({"model":"fixed_logistic_Oplus_molecular","transition_km":cfg.composition_transition_km,"scale_km":cfg.composition_scale_km,"molecular_mass_amu":30.5,"iri":false});
+    document["composition"] = json!({"model":"IRI DS-1995 molecular fraction","molecular_mass_amu":30.5,"iri":true,"atomic_remainder":"O+ approximation","below_75_km":"75 km composition held fixed; outside IRI validity"});
+    document["prescribed_atmosphere"] = json!(cfg.atmosphere);
+    document["limitations"].as_array_mut().unwrap().push(json!("Prescribed MSIS effective molecular-ion collision rate shared by both ion species. IRI DS-1995 climatological molecular fraction; no auroral chemistry. Molecular ions represented by 30.5 amu, atomic remainder by O+. Below 75 km IRI composition held at its lower boundary; heavy cluster-ion mass is not modeled. Atmosphere evaluated at transmitter latitude/longitude and gate-center altitude."));
     document["warm_start_index"] = json!(cfg.warm_start_index);
     document["optimizer"] = json!({"version":"hardened-v3","max_iterations":160,"warm_starts":"same gate, previous time, neighboring altitudes; original two starts retained","rescue":"four independent temperature/velocity/collision seeds on failed, boundary, low-Ti, or high-residual fits"});
     document["model_selection_below_km"] = json!(cfg.model_selection_below_km);
     if cfg.model_selection_below_km.is_some() {
         document["limitations"].as_array_mut().unwrap().push(json!("Below the configured model-selection altitude, compare free/tied temperatures and free/zero collision models using chi-square + parameter_count*ln(real_components). Conditional diagonal-noise criterion, not a calibrated probability; selected constraints are stored per gate."));
     }
-    let bytes = serde_json::to_vec(&document)?;
     document["calibration"] = json!({"magic_constant":cfg.calibration_multiplier,"antenna_efficiency":cfg.antenna_efficiency});
+    let bytes = serde_json::to_vec(&document)?;
     let status = serde_json::to_vec(&document["processing"])?;
     super::super::atomic_bytes(&cfg.export.join("status.json"), &status)?;
     if let Some(live) = &cfg.live_export {
@@ -265,7 +268,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         fingerprint.as_object_mut().unwrap().remove(key);
     }
     let fingerprint = format!(
-        "stream-hardened-v3:{}:{:?}:{}",
+        "stream-msis-iri-v5:{}:{:?}:{}",
         exp.hash,
         seed_hash,
         serde_json::to_string(&fingerprint)?

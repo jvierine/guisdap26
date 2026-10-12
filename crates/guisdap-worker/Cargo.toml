@@ -23,3 +23,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 matfile = "0.5"
 
 guisdap-ion = { path = "../guisdap-ion" }
+
+rmsis = { git = "https://github.com/jvierine/rmsis", rev = "fc707387617885de749dcc516c306a74227cf1b5" }

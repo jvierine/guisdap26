@@ -41,6 +41,8 @@ struct Profile {
 }
 #[derive(Clone, Deserialize)]
 struct Gate {
+    #[serde(default)]
+    prescribed_atmosphere: Option<PrescribedAtmosphere>,
     first_lag_signal_to_noise: Option<f64>,
     settings: Settings,
     altitude_km: f64,
@@ -58,12 +60,23 @@ struct Gate {
     sigma: Vec<[f64; 2]>,
 }
 #[derive(Clone, Deserialize)]
+struct PrescribedAtmosphere {
+    molecular_fraction: f64,
+    below_iri_composition_domain: bool,
+}
+#[derive(Clone, Deserialize)]
 struct Settings {
     tie_electron_ion_temperature: bool,
     fit_collision_rate: bool,
+    #[serde(default)]
+    fixed_collision_s: f64,
 }
 #[derive(Clone, Deserialize)]
 struct Fit {
+    #[serde(default)]
+    covariance: Vec<f64>,
+    #[serde(default)]
+    free_parameter_indices: Vec<usize>,
     plasma: Plasma,
     standard_error: [Option<f64>; 5],
     reduced_chi_square: f64,
@@ -482,12 +495,10 @@ fn acf(v: &Viewer, component: usize) -> String {
         .observed
         .iter()
         .zip(&g.sigma)
-        .map(|(a, e)| a[component].abs() + e[component])
-        .chain(
-            f.model_curve
-                .iter()
-                .map(|p| p.value[component].abs() + p.standard_error.map_or(0., |e| e[component])),
-        )
+        .flat_map(|(a, e)| (0..2).map(move |c| a[c].abs() + e[c]))
+        .chain(f.model_curve.iter().flat_map(|p| {
+            (0..2).map(move |c| p.value[c].abs() + p.standard_error.map_or(0., |e| e[c]))
+        }))
         .fold(1., f64::max);
     let scale = 10f64.powf(magnitude.log10().floor());
     let ymax = (magnitude / scale * 1.1).max(1.);
@@ -710,6 +721,7 @@ fn render(v: &Viewer) {
     for i in 0..2 {
         el(&format!("fit-acf-{i}")).set_inner_html(&acf(v, i));
     }
+    el("fit-spectrum").set_inner_html(&analytical_spectrum(v));
     text(
         "fit-gate-model",
         &format!(
@@ -720,9 +732,22 @@ fn render(v: &Viewer) {
                 "fitted"
             },
             if g.settings.fit_collision_rate {
-                "fitted effective BGK rate"
+                "fitted effective BGK rate".to_string()
             } else {
-                "fixed to zero"
+                if let Some(atmosphere) = &g.prescribed_atmosphere {
+                    format!(
+                        "MSIS {:.3e} s⁻¹ (fixed); IRI DS-1995 molecular fraction {:.3}{}",
+                        g.settings.fixed_collision_s,
+                        atmosphere.molecular_fraction,
+                        if atmosphere.below_iri_composition_domain {
+                            "; below IRI domain, 75 km boundary composition"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!("fixed {:.2} s⁻¹", g.settings.fixed_collision_s)
+                }
             },
             g.first_lag_signal_to_noise.unwrap_or(f64::NAN)
         ),
@@ -1528,4 +1553,200 @@ fn settings_drag() -> Result<(), JsValue> {
         .add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
     resize.forget();
     Ok(())
+}
+
+/// Intrinsic spectrum from the same stateless kinetic model used by the server.
+fn analytical_spectrum(v: &Viewer) -> String {
+    use guisdap_ion::spectrum::{IonSpecies, PlasmaState, SpectrumModel};
+    let g = &selected(v).gates[v.gate];
+    let mut s = svg(620., 330.);
+    let Some(f) = &g.result else {
+        label(&mut s, 50., 80., &g.status, "start");
+        s.push_str("</svg>");
+        return s;
+    };
+    let model = SpectrumModel {
+        radar_frequency_hz: 930e6,
+        electron_collision_s: 0.,
+        ions: vec![
+            IonSpecies {
+                mass_amu: 16.,
+                fraction: g.oxygen_fraction,
+            },
+            IonSpecies {
+                mass_amu: 30.5,
+                fraction: 1. - g.oxygen_fraction,
+            },
+        ],
+    };
+    let frequency: Vec<_> = (0..=800).map(|i| -40000. + i as f64 * 100.).collect();
+    let p = PlasmaState {
+        electron_density_m3: f.plasma.electron_density_m3,
+        ion_temperature_k: f.plasma.ion_temperature_k,
+        electron_temperature_k: f.plasma.electron_temperature_k,
+        velocity_m_s: f.plasma.velocity_m_s,
+        ion_collision_s: f.plasma.ion_collision_s,
+    };
+    let evaluate = |p: PlasmaState| {
+        model.evaluate(p, &frequency).map(|values| {
+            values
+                .into_iter()
+                .map(|y| y * p.electron_density_m3)
+                .collect::<Vec<_>>()
+        })
+    };
+    let Ok(values) = evaluate(p) else {
+        label(
+            &mut s,
+            50.,
+            80.,
+            "Spectrum unavailable for this fit",
+            "start",
+        );
+        s.push_str("</svg>");
+        return s;
+    };
+    let n = f.free_parameter_indices.len();
+    let mut gradients = Vec::new();
+    if n > 0 && f.covariance.len() == n * n {
+        let base = [
+            p.electron_density_m3,
+            p.ion_temperature_k,
+            p.electron_temperature_k,
+            p.velocity_m_s,
+            p.ion_collision_s,
+        ];
+        for &index in &f.free_parameter_indices {
+            if index >= 5 {
+                break;
+            }
+            let delta = (base[index].abs() * 1e-3).max(if index == 0 { 1e5 } else { 0.1 });
+            let change = |amount: f64| {
+                let mut a = base;
+                a[index] += amount;
+                if index == 1 && g.settings.tie_electron_ion_temperature {
+                    a[2] = a[1];
+                }
+                PlasmaState {
+                    electron_density_m3: a[0],
+                    ion_temperature_k: a[1],
+                    electron_temperature_k: a[2],
+                    velocity_m_s: a[3],
+                    ion_collision_s: a[4],
+                }
+            };
+            if let (Ok(plus), Ok(minus)) = (evaluate(change(delta)), evaluate(change(-delta))) {
+                gradients.push(
+                    plus.iter()
+                        .zip(minus)
+                        .map(|(a, b)| (a - b) / (2. * delta))
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                break;
+            }
+        }
+    }
+    let errors: Option<Vec<f64>> = if gradients.len() == n && n > 0 {
+        Some(
+            (0..values.len())
+                .map(|k| {
+                    let mut variance = 0.;
+                    for i in 0..n {
+                        for j in 0..n {
+                            variance += gradients[i][k] * f.covariance[i * n + j] * gradients[j][k];
+                        }
+                    }
+                    variance.max(0.).sqrt()
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let peak = values
+        .iter()
+        .enumerate()
+        .map(|(i, y)| y + errors.as_ref().map_or(0., |e| e[i]))
+        .fold(0., f64::max)
+        .max(1.);
+    let scale = 10f64.powf(peak.log10().floor());
+    let top = peak * 1.08;
+    let x = |hz: f64| 60. + 510. * (hz + 40000.) / 80000.;
+    let y = |value: f64| 270. - 220. * value / top;
+    for tick in [-40, -20, 0, 20, 40] {
+        let xx = x(tick as f64 * 1000.);
+        line(&mut s, xx, 50., xx, 270., "#293d4c");
+        label(&mut s, xx, 292., &tick.to_string(), "middle");
+    }
+    for i in 0..=4 {
+        let value = top * i as f64 / 4.;
+        line(&mut s, 60., y(value), 570., y(value), "#293d4c");
+        label(
+            &mut s,
+            55.,
+            y(value) + 4.,
+            &format!("{:.2}", value / scale),
+            "end",
+        );
+    }
+    label(
+        &mut s,
+        60.,
+        18.,
+        &format!("Ne S(f) / (m⁻³ Hz⁻¹) · ×{scale:.0e}"),
+        "start",
+    );
+    label(&mut s, 315., 320., "Frequency offset / kHz", "middle");
+    if let Some(errors) = &errors {
+        let mut path = String::new();
+        for (i, (&freq, &value)) in frequency.iter().zip(&values).enumerate() {
+            path.push_str(&format!(
+                "{}{},{} ",
+                if i == 0 { "M" } else { "L" },
+                x(freq),
+                y(value + errors[i])
+            ));
+        }
+        for i in (0..values.len()).rev() {
+            path.push_str(&format!(
+                "L{},{} ",
+                x(frequency[i]),
+                y((values[i] - errors[i]).max(0.))
+            ));
+        }
+        path.push('Z');
+        s.push_str(&format!(
+            "<path d='{path}' fill='#efbc50' fill-opacity='0.30'/>"
+        ));
+    }
+    let path = frequency
+        .iter()
+        .zip(&values)
+        .enumerate()
+        .map(|(i, (&freq, &value))| {
+            format!(
+                "{}{},{} ",
+                if i == 0 { "M" } else { "L" },
+                x(freq),
+                y(value)
+            )
+        })
+        .collect::<String>();
+    s.push_str(&format!(
+        "<path d='{path}' fill='none' stroke='#efbc50' stroke-width='2'/>"
+    ));
+    label(
+        &mut s,
+        60.,
+        38.,
+        if errors.is_some() {
+            "Intrinsic two-ion model · ±1σ parameter uncertainty"
+        } else {
+            "Intrinsic two-ion model · uncertainty unavailable"
+        },
+        "start",
+    );
+    s.push_str("</svg>");
+    s
 }
