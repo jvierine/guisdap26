@@ -125,14 +125,35 @@ struct Viewer {
     drag: Option<(f64, f64)>,
     scales: [[f64; 2]; 5],
     quality_limit: f64,
+    quality: guisdap_core::quality::Limits,
     mask_bad: bool,
     hatch_bad: bool,
 }
-fn rejected(g: &Gate, limit: f64) -> bool {
-    g.status == "singular"
-        || g.result
-            .as_ref()
-            .is_none_or(|f| !f.reduced_chi_square.is_finite() || f.reduced_chi_square > limit)
+fn rejection_reasons(g: &Gate, v: &Viewer) -> Vec<&'static str> {
+    let Some(f) = &g.result else {
+        return vec!["fit unavailable"];
+    };
+    guisdap_core::quality::reasons(
+        &g.status,
+        [
+            f.plasma.electron_density_m3,
+            f.plasma.ion_temperature_k,
+            f.plasma.electron_temperature_k,
+            f.plasma.velocity_m_s,
+        ],
+        [
+            f.standard_error[0],
+            f.standard_error[1],
+            f.standard_error[2],
+            f.standard_error[3],
+        ],
+        g.first_lag_signal_to_noise,
+        f.reduced_chi_square,
+        v.quality,
+    )
+}
+fn rejected(g: &Gate, v: &Viewer) -> bool {
+    !rejection_reasons(g, v).is_empty()
 }
 fn selected(v: &Viewer) -> &Profile {
     v.details.get(&v.time).unwrap_or(&v.data.profiles[v.time])
@@ -176,42 +197,24 @@ fn profile(v: &Viewer, param: usize) -> String {
     let bottom = p.gates[v.lower].lower_km;
     let top = p.gates[v.upper].upper_km;
     let y = |h: f64| 460. - (h - bottom) / (top - bottom) * 420.;
-    let (min, max, ticks): (f64, f64, Vec<(f64, String)>) = match param {
-        0 => (
-            8.,
-            13.,
-            (8..=13)
-                .map(|a| {
-                    (
-                        a as f64,
-                        ["10⁸", "10⁹", "10¹⁰", "10¹¹", "10¹²", "10¹³"][(a - 8) as usize]
-                            .to_string(),
-                    )
-                })
-                .collect(),
-        ),
-        1 => (
-            0.,
-            4000.,
-            (0..=4)
-                .map(|i| ((i * 1000) as f64, (i * 1000).to_string()))
-                .collect(),
-        ),
-        2 => (
-            0.,
-            8000.,
-            (0..=4)
-                .map(|i| ((i * 2000) as f64, (i * 2000).to_string()))
-                .collect(),
-        ),
-        _ => (
-            -1000.,
-            1000.,
-            (-2..=2)
-                .map(|i| ((i * 500) as f64, (i * 500).to_string()))
-                .collect(),
-        ),
-    };
+    let [mut min, mut max] = v.scales[param];
+    if param == 0 {
+        min = min.log10();
+        max = max.log10();
+    }
+    let ticks: Vec<_> = (0..=5)
+        .map(|i| {
+            let z = min + (max - min) * i as f64 / 5.;
+            (
+                z,
+                if param == 0 {
+                    format!("10^{z:.2}")
+                } else {
+                    format!("{z:.0}")
+                },
+            )
+        })
+        .collect();
     let x = |a: f64| 65. + (a - min) / (max - min) * 225.;
     let transform = |a: f64| if param == 0 { a.max(1.).log10() } else { a };
     for h in altitude_ticks(bottom, top) {
@@ -225,7 +228,7 @@ fn profile(v: &Viewer, param: usize) -> String {
     label(&mut s, 65., 24., "Altitude / km", "start");
     s.push_str("<defs><clipPath id='fit-area'><rect x='64' y='39' width='227' height='423'/></clipPath></defs><g clip-path='url(#fit-area)'>");
     for (i, g) in p.gates.iter().enumerate().take(v.upper + 1).skip(v.lower) {
-        if v.mask_bad && rejected(g, v.quality_limit) {
+        if v.mask_bad && rejected(g, v) {
             continue;
         }
         if let Some(f) = &g.result {
@@ -313,6 +316,10 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
     let start = v.window_start;
     let end = v.window_end;
     let [mut min, mut max] = v.scales[param];
+    text(
+        &format!("fit-scale-applied-{param}"),
+        &format!("Applied limits: {min:.3e} to {max:.3e}"),
+    );
     if param == 0 || param == 4 {
         min = min.log10();
         max = max.log10();
@@ -342,7 +349,7 @@ fn time_altitude(v: &Viewer, param: usize) -> Result<(), JsValue> {
                 if g.status == "singular" {
                     continue;
                 }
-                let bad = rejected(g, v.quality_limit);
+                let bad = rejected(g, v);
                 if bad && v.mask_bad {
                     continue;
                 }
@@ -596,12 +603,42 @@ fn render(v: &Viewer) {
         el(&format!("fit-profile-{i}")).set_inner_html(&profile(v, i));
     }
     text("fit-quality-value", &format!("{:.1}", v.quality_limit));
-    let rejected_count = p
-        .gates
-        .iter()
-        .filter(|g| rejected(g, v.quality_limit))
-        .count();
-    text("fit-quality-summary", &format!("Selected interval: {rejected_count}/{} gates rejected or unavailable. Higher threshold keeps more data.", p.gates.len()));
+    let rejected_count = p.gates.iter().filter(|g| rejected(g, v)).count();
+    text("fit-quality-summary", &format!("Selected interval: {rejected_count}/{} gates rejected or unavailable. Screened using convergence, bounds, uncertainty and signal significance.", p.gates.len()));
+    let mut counts = BTreeMap::new();
+    for g in &p.gates {
+        for reason in rejection_reasons(g, v) {
+            *counts.entry(reason).or_insert(0) += 1;
+        }
+    }
+    text(
+        "fit-quality-reasons",
+        &counts
+            .iter()
+            .map(|(r, n)| format!("{r}: {n}"))
+            .collect::<Vec<_>>()
+            .join(" · "),
+    );
+    for (id, value) in [
+        (
+            "fit-ne-error-value",
+            format!("{:.0}%", v.quality.density_relative_error * 100.),
+        ),
+        (
+            "fit-temperature-error-value",
+            format!("{:.0}%", v.quality.temperature_relative_error * 100.),
+        ),
+        (
+            "fit-velocity-error-value",
+            format!("{:.0} m/s", v.quality.velocity_error_m_s),
+        ),
+        (
+            "fit-signal-value",
+            format!("{:.1}", v.quality.minimum_signal_significance),
+        ),
+    ] {
+        text(id, &value);
+    }
     let revision = v.data.processing.as_ref().map_or(0, |p| p.updated_unix);
     let key = (
         v.window_start.to_bits(),
@@ -944,7 +981,8 @@ pub async fn start_ion() -> Result<(), JsValue> {
             [1e8, 1e13],
         ],
         quality_limit: 10.,
-        mask_bad: false,
+        quality: guisdap_core::quality::Limits::default(),
+        mask_bad: true,
         hatch_bad: true,
     }));
     render(&state.borrow());
@@ -995,6 +1033,10 @@ pub async fn start_ion() -> Result<(), JsValue> {
                 }
                 text("fit-scale-error", "Colour limits need finite min < max; density limits must be positive; velocity limits must straddle zero.");
             });
+            if edge == 0 {
+                el(&format!("fit-scale-apply-{param}"))
+                    .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+            }
             el(&id).add_event_listener_with_callback("input", cb.as_ref().unchecked_ref())?;
             el(&id).add_event_listener_with_callback("change", cb.as_ref().unchecked_ref())?;
             cb.forget();
@@ -1002,6 +1044,11 @@ pub async fn start_ion() -> Result<(), JsValue> {
     }
     for (id, event) in [
         ("fit-quality", "input"),
+        ("fit-ne-error", "input"),
+        ("fit-temperature-error", "input"),
+        ("fit-velocity-error", "input"),
+        ("fit-signal", "input"),
+        ("fit-residual-enabled", "change"),
         ("fit-mask-bad", "change"),
         ("fit-hatch-bad", "change"),
         ("fit-slider", "input"),
@@ -1023,7 +1070,14 @@ pub async fn start_ion() -> Result<(), JsValue> {
                 let mut v = state.borrow_mut();
                 let last = v.data.profiles[v.time].gates.len() - 1;
                 match id {
-                    "fit-quality" | "fit-mask-bad" | "fit-hatch-bad" => {
+                    "fit-quality"
+                    | "fit-mask-bad"
+                    | "fit-hatch-bad"
+                    | "fit-ne-error"
+                    | "fit-temperature-error"
+                    | "fit-velocity-error"
+                    | "fit-signal"
+                    | "fit-residual-enabled" => {
                         v.quality_limit = 10_f64.powf(
                             el("fit-quality")
                                 .dyn_into::<HtmlInputElement>()
@@ -1032,6 +1086,24 @@ pub async fn start_ion() -> Result<(), JsValue> {
                                 .parse::<f64>()
                                 .unwrap_or(1.),
                         );
+                        let number = |id: &str, fallback: f64| {
+                            el(id)
+                                .dyn_into::<HtmlInputElement>()
+                                .unwrap()
+                                .value()
+                                .parse::<f64>()
+                                .unwrap_or(fallback)
+                        };
+                        v.quality.density_relative_error = number("fit-ne-error", 50.) / 100.;
+                        v.quality.temperature_relative_error =
+                            number("fit-temperature-error", 100.) / 100.;
+                        v.quality.velocity_error_m_s = number("fit-velocity-error", 300.);
+                        v.quality.minimum_signal_significance = number("fit-signal", 3.);
+                        v.quality.maximum_residual = el("fit-residual-enabled")
+                            .dyn_into::<HtmlInputElement>()
+                            .unwrap()
+                            .checked()
+                            .then_some(v.quality_limit);
                         v.mask_bad = el("fit-mask-bad")
                             .dyn_into::<HtmlInputElement>()
                             .unwrap()
@@ -1201,7 +1273,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         let val = if param == 4 {
                             p.raw_ne.get(gi).and_then(|a| *a).map(|a| a[0])
                         } else {
-                            if v.mask_bad && rejected(g, v.quality_limit) {
+                            if v.mask_bad && rejected(g, &v) {
                                 None
                             } else {
                                 g.result.as_ref().map(|f| value(&f.plasma, param))
@@ -1226,10 +1298,13 @@ pub async fn start_ion() -> Result<(), JsValue> {
                                             "unavailable".into(),
                                             |f| format!("{:.2}", f.reduced_chi_square)
                                         ),
-                                        if rejected(g, v.quality_limit) {
-                                            "rejected"
+                                        if rejected(g, &v) {
+                                            format!(
+                                                "rejected: {}",
+                                                rejection_reasons(g, &v).join(", ")
+                                            )
                                         } else {
-                                            "within threshold"
+                                            "passes display screening".to_string()
                                         }
                                     )
                                 }

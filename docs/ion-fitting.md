@@ -200,3 +200,15 @@ changes during the session. Te defaults to 0–4000 K; Ti to 0–2000 K. Velocit
 a seismic blue–white–red scale centred at zero, including asymmetric limits.
 Dragging previews the shared time selection across all rows; leaving the plot
 cancels the drag. Powers of ten use locally served MathJax 3.2.2 SVG rendering.
+
+
+Display screening now rejects optimizer failures, bound-limited solutions and
+singular/low-information fits independently of residual score. Adjustable checks
+use the exported final standard errors: default σNe/Ne ≤ 50%, σTi/Ti and σTe/Te
+≤ 100%, σv ≤ 300 m/s, and first-lag mean / temporal standard error ≥ 3.
+These are pragmatic display defaults, not a calibrated probability of correctness.
+NaN masking defaults on; raw measurements and diagnostics stay inspectable.
+The residual cutoff is optional and defaults off because correlated lags and
+few-record variance estimates invalidate a simple chi-square interpretation.
+Colour settings update on input and also have explicit Apply buttons with applied
+limits shown. The selected-time parameter axes use the same configured limits.
