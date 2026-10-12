@@ -1136,6 +1136,24 @@ pub async fn start_ion() -> Result<(), JsValue> {
         cb.forget();
     }
     for param in 0..5 {
+        let state = state.clone();
+        let reset = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let mut v = state.borrow_mut();
+            let start = v.data.profiles[0].start_unix;
+            let end = v.data.profiles.last().unwrap().end_unix;
+            v.lower = 0;
+            v.upper = v.data.profiles[v.time].gates.len() - 1;
+            v.drag = None;
+            selection(None);
+            set_window(&mut v, start, end);
+            render(&v);
+        });
+        el(&format!("fit-raster-{param}"))
+            .add_event_listener_with_callback("contextmenu", reset.as_ref().unchecked_ref())?;
+        reset.forget();
+    }
+    for param in 0..5 {
         for event in ["mousedown", "mouseup", "mousemove", "mouseleave"] {
             let state = state.clone();
             let id = format!("fit-raster-{param}");
@@ -1155,6 +1173,9 @@ pub async fn start_ion() -> Result<(), JsValue> {
                         return;
                     }
                     if event == "mousedown" {
+                        if event_data.button() != 0 {
+                            return;
+                        }
                         v.drag = Some((x, t));
                         return;
                     }
