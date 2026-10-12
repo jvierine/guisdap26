@@ -1,4 +1,4 @@
-# GUISDAP26
+# RUISDAP
 
 Rust compute and a Rust/WebAssembly/WebGL2 viewer for incoherent-scatter radar data.
 The first vertical slice processes Tromsø UHF **BEATA 2.2, 2022-11-02,
