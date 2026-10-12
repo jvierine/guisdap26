@@ -658,9 +658,7 @@ pub fn run(path: &Path) -> Result<()> {
     let tmp = tempfile::NamedTempFile::new_in(&cfg.output)?;
     {
         let h = hdf5::File::create(tmp.path())?;
-        h.new_dataset_builder()
-            .with_data(&json)
-            .create("metadata_and_diagnostics_json")?;
+        crate::storage::bytes(&h, "metadata_and_diagnostics_json", &json)?;
         h.new_dataset_builder()
             .with_data(&exp.frequency_hz)
             .create("model_frequency_hz")?;
@@ -704,11 +702,7 @@ pub fn run(path: &Path) -> Result<()> {
                 ("parameters_ne_ti_te_v_nu", values),
                 ("standard_error", errors),
             ] {
-                let d = gr
-                    .new_dataset::<f64>()
-                    .shape([p.gates.len(), 5])
-                    .create(name)?;
-                d.write_raw(&data)?;
+                let d = crate::storage::array(&gr, name, [p.gates.len(), 5], &data)?;
                 d.new_attr_builder()
                     .with_data("m^-3,K,K,m s^-1,s^-1")
                     .create("column_units")?;
@@ -736,11 +730,12 @@ pub fn run(path: &Path) -> Result<()> {
                             [p.lag_s, p.value[0], p.value[1], e[0], e[1]]
                         })
                         .collect();
-                    let ds = gg
-                        .new_dataset::<f64>()
-                        .shape([r.model_curve.len(), 5])
-                        .create("model_curve")?;
-                    ds.write_raw(&curve)?;
+                    let ds = crate::storage::array(
+                        &gg,
+                        "model_curve",
+                        [r.model_curve.len(), 5],
+                        &curve,
+                    )?;
                     ds.new_attr_builder().with_data("lag_s,mean_real,mean_imag,sigma_real,sigma_imag; s,m^-3,m^-3,m^-3,m^-3").create("columns")?;
                     let n = r.free_parameter_indices.len();
                     if r.covariance.len() == n * n {
@@ -764,11 +759,7 @@ pub fn run(path: &Path) -> Result<()> {
                         continue;
                     }
                     let flat: Vec<_> = values.iter().flatten().copied().collect();
-                    let ds = gg
-                        .new_dataset::<f64>()
-                        .shape([values.len(), 2])
-                        .create(name)?;
-                    ds.write_raw(&flat)?;
+                    let ds = crate::storage::array(&gg, name, [values.len(), 2], &flat)?;
                     ds.new_attr_builder()
                         .with_data(if name == "standardized_residual" {
                             "1"
@@ -810,4 +801,8 @@ pub fn run(path: &Path) -> Result<()> {
     tmp.persist(dest).map_err(|e| e.error)?;
     eprintln!("Wrote {} profiles to {}", profiles.len(), h5path.display());
     Ok(())
+}
+
+pub fn compact_products(path: &Path) -> Result<()> {
+    stream::compact_products(path)
 }

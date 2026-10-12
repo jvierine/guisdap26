@@ -3,9 +3,10 @@ pub fn write(path: &Path, p: &Profile, key: &str, frequency: &[f64]) -> Result<(
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     {
         let h = hdf5::File::create(tmp.path())?;
-        h.new_dataset_builder()
-            .with_data(serde_json::to_vec(p)?.as_slice())
-            .create("profile_json")?;
+        crate::storage::bytes(&h, "profile_json", &serde_json::to_vec(p)?)?;
+        h.new_attr_builder()
+            .with_data("ruisdap-ion-profile-v2; bulk f32, time/covariance f64")
+            .create("storage_schema")?;
         h.new_dataset_builder()
             .with_data(key.as_bytes())
             .create("cache_key")?;
@@ -51,11 +52,7 @@ pub fn write(path: &Path, p: &Profile, key: &str, frequency: &[f64]) -> Result<(
             ("parameters_ne_ti_te_v_nu", values),
             ("standard_error", errors),
         ] {
-            let d = gr
-                .new_dataset::<f64>()
-                .shape([p.gates.len(), 5])
-                .create(name)?;
-            d.write_raw(&data)?;
+            let d = crate::storage::array(&gr, name, [p.gates.len(), 5], &data)?;
             d.new_attr_builder()
                 .with_data("m^-3,K,K,m s^-1,s^-1")
                 .create("column_units")?;
@@ -83,11 +80,8 @@ pub fn write(path: &Path, p: &Profile, key: &str, frequency: &[f64]) -> Result<(
                         [p.lag_s, p.value[0], p.value[1], e[0], e[1]]
                     })
                     .collect();
-                let ds = gg
-                    .new_dataset::<f64>()
-                    .shape([r.model_curve.len(), 5])
-                    .create("model_curve")?;
-                ds.write_raw(&curve)?;
+                let ds =
+                    crate::storage::array(&gg, "model_curve", [r.model_curve.len(), 5], &curve)?;
                 ds.new_attr_builder()
                     .with_data(
                         "lag_s,mean_real,mean_imag,sigma_real,sigma_imag; s,m^-3,m^-3,m^-3,m^-3",
@@ -115,11 +109,7 @@ pub fn write(path: &Path, p: &Profile, key: &str, frequency: &[f64]) -> Result<(
                     continue;
                 }
                 let flat: Vec<_> = values.iter().flatten().copied().collect();
-                let ds = gg
-                    .new_dataset::<f64>()
-                    .shape([values.len(), 2])
-                    .create(name)?;
-                ds.write_raw(&flat)?;
+                let ds = crate::storage::array(&gg, name, [values.len(), 2], &flat)?;
                 ds.new_attr_builder()
                     .with_data(if name == "standardized_residual" {
                         "1"
@@ -147,11 +137,7 @@ pub fn write(path: &Path, p: &Profile, key: &str, frequency: &[f64]) -> Result<(
             .iter()
             .flat_map(|v| v.unwrap_or([f64::NAN; 2]))
             .collect();
-        let ds = gr
-            .new_dataset::<f64>()
-            .shape([p.raw_ne.len(), 2])
-            .create("raw_ne_and_sigma")?;
-        ds.write_raw(&raw)?;
+        let ds = crate::storage::array(&gr, "raw_ne_and_sigma", [p.raw_ne.len(), 2], &raw)?;
         ds.new_attr_builder()
             .with_data("m^-3; signed 10 us lag equivalent; mean,sigma")
             .create("units")?;

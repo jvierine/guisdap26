@@ -61,6 +61,11 @@ struct View {
     month: String,
     date: String,
     filter: String,
+    processed: String,
+    newest: bool,
+    page: usize,
+    page_size: usize,
+    list: bool,
     selected: Option<String>,
     tab: String,
 }
@@ -74,12 +79,92 @@ fn escape(s: &str) -> String {
 fn input(id: &str) -> HtmlInputElement {
     el(id).dyn_into().unwrap()
 }
+fn processed(e: &Entry) -> bool {
+    e.products.iter().any(|p| p.complete)
+}
+fn status(e: &Entry) -> &'static str {
+    if processed(e) {
+        "Processed"
+    } else if e.products.is_empty() {
+        "Unprocessed"
+    } else {
+        "Partial products"
+    }
+}
+fn select(id: &str) -> String {
+    el(id).dyn_into::<HtmlSelectElement>().unwrap().value()
+}
 fn matches(v: &View, e: &Entry) -> bool {
-    format!("{} {}", e.experiment, e.radar)
+    format!("{} {} {}", e.date, e.experiment, e.radar)
         .to_lowercase()
         .contains(&v.filter.to_lowercase())
+        && match v.processed.as_str() {
+            "processed" => processed(e),
+            "unprocessed" => !processed(e),
+            _ => true,
+        }
 }
-fn render(v: &View) {
+fn render(v: &mut View) {
+    let mut entries: Vec<_> = v
+        .inventory
+        .experiments
+        .iter()
+        .filter(|e| matches(v, e))
+        .collect();
+    entries.sort_by(|a, b| {
+        let dates = if v.newest {
+            b.date.cmp(&a.date)
+        } else {
+            a.date.cmp(&b.date)
+        };
+        dates
+            .then_with(|| a.experiment.cmp(&b.experiment))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let count = entries.len();
+    let pages = count.div_ceil(v.page_size).max(1);
+    v.page = v.page.min(pages - 1);
+    let start = v.page * v.page_size;
+    text(
+        "page-summary",
+        &format!(
+            "{}–{} of {} experiments · Page {} of {}",
+            if count == 0 { 0 } else { start + 1 },
+            (start + v.page_size).min(count),
+            count,
+            v.page + 1,
+            pages
+        ),
+    );
+    for (id, disabled) in [
+        ("previous-page", v.page == 0),
+        ("next-page", v.page + 1 >= pages),
+    ] {
+        if disabled {
+            let _ = el(id).set_attribute("disabled", "");
+        } else {
+            let _ = el(id).remove_attribute("disabled");
+        }
+    }
+    let rows = entries.iter().skip(start).take(v.page_size).map(|e| format!(
+        "<tr class='{}'><td>{}</td><td><button data-experiment='{}'>{}</button></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+        if v.selected.as_deref()==Some(&e.id) {"selected-row"} else {""}, escape(&e.date),escape(&e.id),escape(&e.experiment),escape(&e.radar),status(e),e.hours.len()
+    )).collect::<String>();
+    el("experiment-rows").set_inner_html(&if count == 0 {
+        "<tr><td colspan='5'>No experiments match these filters.</td></tr>".into()
+    } else {
+        rows
+    });
+    for (id, hide) in [("list-panel", !v.list), ("calendar-panel", v.list)] {
+        if hide {
+            let _ = el(id).set_attribute("hidden", "");
+        } else {
+            let _ = el(id).remove_attribute("hidden");
+        }
+    }
+    let _ = el("list-mode").set_attribute("aria-pressed", if v.list { "true" } else { "false" });
+    let _ =
+        el("calendar-mode").set_attribute("aria-pressed", if v.list { "false" } else { "true" });
     text("catalog-status",&format!("{} experiment-days · {} directories checked · {} · {} read errors · {} depth-limited directories. {}",v.inventory.experiments.len(),v.inventory.directories,if v.inventory.scanning{"Scanning archive"}else{"Scan complete"},v.inventory.errors,v.inventory.skipped_at_depth,v.inventory.updated));
     text("catalog-sources",&format!("Sources: {}. UTC dates from archive directory names; recordings are validated during processing.",v.inventory.sources.join(", ")));
     let Ok(first) = NaiveDate::parse_from_str(&format!("{}-01", v.month), "%Y-%m-%d") else {
@@ -96,7 +181,7 @@ fn render(v: &View) {
             .iter()
             .filter(|e| e.date == date && matches(v, e))
             .collect();
-        let processed = entries.iter().filter(|e| !e.products.is_empty()).count();
+        let processed = entries.iter().filter(|e| processed(e)).count();
         html.push_str(&format!("<button class='day {} {}' data-date='{date}' aria-label='{date}: {} experiments, {processed} with products' aria-pressed='{}'><b>{}</b><span>{}</span><small>{}</small></button>",if day.month()==first.month(){""}else{"outside"},if date==v.date{"selected"}else{""},entries.len(),date==v.date,day.day(),if entries.is_empty(){String::new()}else{format!("{} experiments",entries.len())},if processed>0{format!("{processed} processed")}else{String::new()}));
     }
     el("calendar").set_inner_html(&html);
@@ -111,7 +196,7 @@ fn render(v: &View) {
         "<p>No experiments found for this date and filter. Inventory may still be scanning.</p>"
             .into()
     } else {
-        entries.iter().map(|e|format!("<button class='experiment {}' data-experiment='{}'><strong>{}</strong><span>{} · {} hour directories · {} · {}</span></button>",if v.selected.as_deref()==Some(&e.id){"selected"}else{""},e.id,escape(&e.experiment),escape(&e.radar),e.hours.len(),escape(&e.sources.join(", ")),if e.products.is_empty(){"Raw"}else{"Products available"})).collect::<String>()
+        entries.iter().map(|e|format!("<button class='experiment {}' data-experiment='{}'><strong>{}</strong><span>{} · {} hour directories · {} · {}</span></button>",if v.selected.as_deref()==Some(&e.id){"selected"}else{""},e.id,escape(&e.experiment),escape(&e.radar),e.hours.len(),escape(&e.sources.join(", ")),status(e))).collect::<String>()
     };
     el("experiments").set_inner_html(&html);
     let Some(e) = v
@@ -123,7 +208,7 @@ fn render(v: &View) {
         el("experiment-detail").set_inner_html("");
         return;
     };
-    let mut html=format!("<h2>{} · {}</h2><p>Observed hours (UTC): {}</p><div class='experiment-tabs'><button data-product-tab='ion' aria-pressed='true'>Ion-line</button><button data-product-tab='plasma' aria-pressed='false'>Plasma-line</button></div>",escape(&e.experiment),e.date,escape(&e.hours.join(", ")));
+    let mut html=format!("<h2>{} · {}</h2><p>Observed hours (UTC): {}</p><div class='experiment-tabs'><button data-product-tab='ion' aria-pressed='{}'>Ion-line</button><button data-product-tab='plasma' aria-pressed='{}'>Plasma-line</button></div>",escape(&e.experiment),e.date,escape(&e.hours.join(", ")),v.tab=="ion",v.tab=="plasma");
     for kind in ["ion", "plasma"] {
         html.push_str(&format!("<div id='products-{kind}' {}><table><thead><tr><th>Analysis</th><th>Status</th><th>Open</th></tr></thead><tbody>",if kind!=v.tab{"hidden"}else{""}));
         let products: Vec<_> = e
@@ -202,6 +287,11 @@ pub async fn start_catalog() -> Result<(), JsValue> {
         date,
         inventory,
         filter: String::new(),
+        processed: "all".into(),
+        newest: true,
+        page: 0,
+        page_size: 25,
+        list: true,
         selected: None,
         tab: "ion".into(),
     }));
@@ -220,18 +310,37 @@ pub async fn start_catalog() -> Result<(), JsValue> {
             .map(|m| format!("<option>{m}</option>"))
             .collect::<String>()
     ));
-    render(&state.borrow());
+    render(&mut state.borrow_mut());
     queue().await?;
     if web_sys::window().unwrap().location().hash()? == "#queue" {
         el("calendar-view").set_attribute("hidden", "")?;
         el("queue-view").remove_attribute("hidden")?;
     }
-    for id in ["month", "filter", "available-months"] {
+    for id in [
+        "month",
+        "filter",
+        "available-months",
+        "processed-filter",
+        "date-order",
+        "page-size",
+    ] {
         let st = state.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
             let mut v = st.borrow_mut();
             if id == "filter" {
-                v.filter = input(id).value()
+                v.filter = input(id).value();
+                v.page = 0;
+                v.selected = None;
+            } else if id == "processed-filter" {
+                v.processed = select(id);
+                v.page = 0;
+                v.selected = None;
+            } else if id == "date-order" {
+                v.newest = select(id) == "newest";
+                v.page = 0;
+            } else if id == "page-size" {
+                v.page_size = select(id).parse().unwrap_or(25);
+                v.page = 0;
             } else {
                 let value = if id == "month" {
                     input(id).value()
@@ -244,9 +353,12 @@ pub async fn start_catalog() -> Result<(), JsValue> {
                 v.month = value;
                 input("month").set_value(&v.month);
             }
-            render(&v);
+            render(&mut v);
         });
-        el(id).add_event_listener_with_callback("change", cb.as_ref().unchecked_ref())?;
+        el(id).add_event_listener_with_callback(
+            if id == "filter" { "input" } else { "change" },
+            cb.as_ref().unchecked_ref(),
+        )?;
         cb.forget();
     }
     let st = state.clone();
@@ -264,24 +376,25 @@ pub async fn start_catalog() -> Result<(), JsValue> {
             let mut v = st.borrow_mut();
             v.date = date;
             v.selected = None;
-            render(&v);
+            render(&mut v);
         }
         if let Some(id) = button.get_attribute("data-experiment") {
             let mut v = st.borrow_mut();
+            if let Some(e) = v.inventory.experiments.iter().find(|e| e.id == id) {
+                let date = e.date.clone();
+                v.month = date[..7].into();
+                v.date = date;
+                input("month").set_value(&v.month);
+            }
             v.selected = Some(id);
             v.tab = "ion".into();
-            render(&v);
+            render(&mut v);
+            el("experiment-detail").scroll_into_view();
         }
         if let Some(kind) = button.get_attribute("data-product-tab") {
-            st.borrow_mut().tab = kind.clone();
-            for k in ["ion", "plasma"] {
-                let e = el(&format!("products-{k}"));
-                if k == kind {
-                    let _ = e.remove_attribute("hidden");
-                } else {
-                    let _ = e.set_attribute("hidden", "");
-                }
-            }
+            let mut v = st.borrow_mut();
+            v.tab = kind;
+            render(&mut v);
         }
         if let Some(id) = button.get_attribute("data-process") {
             spawn_local(async move {
@@ -296,6 +409,17 @@ pub async fn start_catalog() -> Result<(), JsValue> {
             });
         }
         let id = button.id();
+        if ["list-mode", "calendar-mode", "previous-page", "next-page"].contains(&id.as_str()) {
+            let mut v = st.borrow_mut();
+            match id.as_str() {
+                "list-mode" => v.list = true,
+                "calendar-mode" => v.list = false,
+                "previous-page" => v.page = v.page.saturating_sub(1),
+                "next-page" => v.page += 1,
+                _ => {}
+            }
+            render(&mut v);
+        }
         if id == "show-queue" || id == "show-calendar" {
             let show = id == "show-queue";
             for (name, hide) in [("calendar-view", show), ("queue-view", !show)] {
@@ -343,7 +467,7 @@ pub async fn start_catalog() -> Result<(), JsValue> {
                             .map(|m| format!("<option>{m}</option>"))
                             .collect::<String>()
                     ));
-                    render(&st.borrow());
+                    render(&mut st.borrow_mut());
                 }
             }
         });

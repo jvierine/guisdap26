@@ -7,6 +7,8 @@ struct Settings {
     ion_index_url: String,
     radar_frequency_hz: f64,
     calibration_multiplier: f64,
+    #[serde(default)]
+    analysis_config_url: Option<String>,
 }
 #[derive(Deserialize)]
 struct Response {
@@ -709,6 +711,16 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
                 sync.ready = true;
             }
             let settings: Settings = json("calibration-config.json").await?;
+            if let Some(url)=&settings.analysis_config_url {
+                let summary: Result<String,JsValue> = async {
+                    let cfg: serde_json::Value=json(url).await?;
+                    let dataset=cfg["datasets"].as_array().and_then(|d|d.iter().find(|d|d["integration_s"]==60)).ok_or_else(||error("No one-minute product"))?;
+                    let index: serde_json::Value=json(dataset["data_url"].as_str().ok_or_else(||error("Missing product URL"))?).await?;
+                    let constant=index["calibration"]["magic_constant"].as_f64().ok_or_else(||error("Missing calibration provenance"))?;
+                    Ok(format!("Current one-minute ion analysis: C = {constant:.5}. Calibration reference measurements below retain C = {:.4}; these are the original data used to estimate the new constant.",settings.calibration_multiplier))
+                }.await;
+                text("cal-analysis-used",&summary.unwrap_or_else(|_|"Current ion-analysis calibration unavailable; open Ion-line to inspect product provenance.".into()));
+            }
             let fits: Fits = json(&settings.ion_index_url).await?;
             let response: Response = json("data/beata-short-lag-response.json").await?;
             {

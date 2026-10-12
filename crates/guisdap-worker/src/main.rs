@@ -2,6 +2,7 @@ mod ion;
 mod ion_index;
 mod mat4;
 mod plasma_average;
+mod storage;
 mod study;
 use anyhow::{ensure, Context, Result};
 use axum::response::IntoResponse;
@@ -45,6 +46,11 @@ enum Command {
     IndexIon {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Repack completed ion profiles without refitting; retains full-precision restart data.
+    CompactIon {
+        #[arg(long)]
+        input: PathBuf,
     },
     FitIon {
         #[arg(long)]
@@ -641,6 +647,7 @@ async fn main() -> Result<()> {
             threads,
         } => plasma_average::run(&input, &output, integration_s, threads),
         Command::FitIon { config } => ion::run(&config),
+        Command::CompactIon { input } => ion::compact_products(&input),
         Command::IndexIon { config } => ion_index::run(&config),
         Command::Analyze {
             config,

@@ -945,6 +945,32 @@ async fn refresh(state: Rc<RefCell<Viewer>>, study: Option<String>) {
         v.refresh_busy = true;
     }
     let datasets = state.borrow().datasets.clone();
+    let original = web_sys::window()
+        .unwrap()
+        .location()
+        .search()
+        .unwrap_or_default()
+        .trim_start_matches('?')
+        .split('&')
+        .any(|p| p == "original=1");
+    if !original {
+        if let Ok(current) = json::<Location>(&super::experiment_config("ion-config.json")).await {
+            let changed = current
+                .datasets
+                .iter()
+                .map(|d| &d.data_url)
+                .ne(datasets.iter().map(|d| &d.data_url));
+            let _ = el("fit-product-update").set_attribute(
+                "style",
+                if changed {
+                    "height:2em;visibility:visible"
+                } else {
+                    "height:2em;visibility:hidden"
+                },
+            );
+        }
+    }
+
     for (i, d) in datasets.iter().enumerate() {
         let status_url = format!(
             "{}/status.json",
@@ -1000,14 +1026,17 @@ fn seconds(s: &str) -> Option<f64> {
 }
 #[wasm_bindgen]
 pub async fn start_ion() -> Result<(), JsValue> {
+    let original = web_sys::window()
+        .unwrap()
+        .location()
+        .search()?
+        .trim_start_matches('?')
+        .split('&')
+        .any(|p| p == "original=1");
     let config_url = super::experiment_config("ion-config.json");
-    let location: Location = if config_url == "ion-config.json"
-        && !web_sys::window()
-            .unwrap()
-            .location()
-            .search()?
-            .contains("original=1")
-    {
+    let location: Location = if original {
+        json("ion-config-original.json").await?
+    } else if config_url == "ion-config.json" {
         match json("catalog/default-ion-config.json").await {
             Ok(v) => v,
             Err(_) => json(&config_url).await?,

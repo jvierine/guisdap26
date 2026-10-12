@@ -662,6 +662,15 @@ fn monitor(app: App) {
                 }
                 if changed {
                     write_json(&app.config.public.join("default-ion-config.json"), &cfg)?;
+                    // Keep older browser builds on the same calibrated default.
+                    write_json(
+                        &app.config
+                            .public
+                            .parent()
+                            .context("catalog public parent")?
+                            .join("ion-config.json"),
+                        &cfg,
+                    )?;
                 }
             }
             if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {

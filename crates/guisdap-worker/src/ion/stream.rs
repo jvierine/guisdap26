@@ -469,9 +469,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     let tmp = tempfile::NamedTempFile::new_in(&cfg.output)?;
     {
         let h = hdf5::File::create(tmp.path())?;
-        h.new_dataset_builder()
-            .with_data(&manifest)
-            .create("manifest_json")?;
+        crate::storage::bytes(&h, "manifest_json", &manifest)?;
         h.flush()?;
     }
     tmp.persist(cfg.output.join("index.h5"))
@@ -480,5 +478,59 @@ pub fn run(cfg: &Config) -> Result<()> {
         failed == 0,
         "{failed} failed intervals; inspect processing status"
     );
+    Ok(())
+}
+
+/// Repack only completed products, validating the full-precision restart record
+/// before atomic replacement. No science or browser data are recomputed.
+pub fn compact_products(path: &Path) -> Result<()> {
+    ensure!(
+        path.join("index.h5").is_file(),
+        "Only completed ion product directories can be compacted"
+    );
+    let mut before = 0u64;
+    let mut after = 0u64;
+    let files = fs::read_dir(path.join("profiles"))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for file in files {
+        if file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".compact.h5"))
+        {
+            continue;
+        }
+        if file.extension().and_then(|s| s.to_str()) != Some("h5") {
+            continue;
+        }
+        let h = hdf5::File::open(&file)?;
+        let original = h.dataset("profile_json")?.read_raw::<u8>()?;
+        let profile: Profile = serde_json::from_slice(&original)?;
+        let key = String::from_utf8(h.dataset("cache_key")?.read_raw::<u8>()?)?;
+        let frequency = h.dataset("model_frequency_hz")?.read_raw::<f64>()?;
+        drop(h);
+        let candidate = file.with_extension("compact.h5");
+        store::write(&candidate, &profile, &key, &frequency)?;
+        let check = hdf5::File::open(&candidate)?;
+        let recovered: Value =
+            serde_json::from_slice(&check.dataset("profile_json")?.read_raw::<u8>()?)?;
+        ensure!(
+            recovered == serde_json::from_slice::<Value>(&original)?,
+            "Restart record changed"
+        );
+        ensure!(
+            check
+                .dataset("profile/time_bounds_unix_s")?
+                .read_raw::<f64>()?
+                == vec![profile.start_unix, profile.end_unix],
+            "Timestamp changed"
+        );
+        drop(check);
+        before += fs::metadata(&file)?.len();
+        after += fs::metadata(&candidate)?.len();
+        fs::rename(candidate, file)?;
+    }
+    println!("Ion profiles: {before} -> {after} bytes; full-precision restart records verified");
     Ok(())
 }

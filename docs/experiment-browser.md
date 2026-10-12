@@ -1,6 +1,11 @@
 # Experiment calendar and processing queue
 
-Open `/guisdap/catalog.html`. Select a UTC day and an experiment. Ion-line products
+Open `/guisdap/catalog.html`. The default list shows all inventoried experiment-days,
+newest first, with 25/50/100 rows per page and oldest-first ordering available.
+Search dates, experiment names or radars. All / Processed / Unprocessed filters
+apply to both the list and Calendar view. Processed means at least one completed
+product; partial-only entries remain in Unprocessed. Select an experiment from
+the list, or switch to Calendar and select a UTC day. Ion-line products
 are the default tab; Plasma-line is the other tab. Processing queue shows jobs,
 the current stage and interval count, core allocation and calibration revision.
 Existing products remain readable while new results are produced.

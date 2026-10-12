@@ -42,3 +42,5 @@ measured ACF matrix DFT with the analytical ISR spectrum.
 - [Signal processing and range responses](docs/science.md)
 - [Deployment](docs/deployment.md)
 - [Legacy GUISDAP references](docs/legacy.md)
+
+[Data product format and reader examples](docs/data-products.md) · [Experiment browser](docs/experiment-browser.md)
