@@ -359,7 +359,7 @@ fn table(state: &Cal) {
             format!("{} included points · median multiplier ratio {:.4} · range {:.4}–{:.4}. Repeat clicks are not independent measurements. No processing settings have been changed.",n,median,values[0],values[n-1])
         },
     );
-    let export = serde_json::json!({"schema":"guisdap26-plasma-calibration-v1","method":"Unmagnetized Bohm-Gross; finite-Debye ion power Ne/[(1+q)(1+q+Te/Ti)]. Measured 10-us raw Ne converted with the experiment spectral response and fitted shape at plasma-line density; finite-Debye equivalent power. No raw short-lag zero-lag substitution; no drift correction. Approximation, not a kinetic dispersion inversion.","points":c.points});
+    let export = serde_json::json!({"schema":"guisdap26-plasma-calibration-v1","method":"Unmagnetized Bohm-Gross; finite-Debye ion power Ne/[(1+q)(1+q+Te/Ti)]. Measured 10-us raw Ne converted with the experiment spectral response and fitted shape at plasma-line density; finite-Debye equivalent power. No raw short-lag zero-lag substitution; no drift correction. Approximation, not a kinetic dispersion inversion.","points":c.points,"gain_fit":guisdap_core::calibration::fit_gain(&c.points.iter().filter(|p|p.included).map(|p|(p.raw_ne_proxy_m3,p.raw_ne_proxy_m3*p.estimate.calibration_multiplier_ratio,p.ion_start_unix.to_bits())).collect::<Vec<_>>())});
     let uri = js_sys::encode_uri_component(&serde_json::to_string_pretty(&export).unwrap());
     let _ = el("cal-export").set_attribute(
         "href",
@@ -441,6 +441,46 @@ fn table(state: &Cal) {
         scatter.push_str(&format!("<text x='{px}' y='292' text-anchor='middle'>{:.1e}</text><text x='55' y='{py}' text-anchor='end'>{:.1e}</text>",10_f64.powf(z),10_f64.powf(z)));
     }
     scatter.push_str("<path d='M60,270 L610,40' stroke='#617889' stroke-dasharray='4 4'/><text x='325' y='320' text-anchor='middle'>Measured raw Ne / m⁻³ · log axes · dashed line: ratio 1</text>");
+    let samples: Vec<_> = c
+        .points
+        .iter()
+        .filter(|p| p.included)
+        .map(|p| {
+            (
+                p.raw_ne_proxy_m3,
+                p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio,
+                p.ion_start_unix.to_bits(),
+            )
+        })
+        .collect();
+    let gain_fit = guisdap_core::calibration::fit_gain(&samples);
+    scatter.push_str("<defs><clipPath id='cal-fit-clip'><rect x='60' y='40' width='550' height='230'/></clipPath></defs><g clip-path='url(#cal-fit-clip)'>");
+    if let Some(fit) = &gain_fit {
+        if let Some(se) = fit.standard_error {
+            let lower = fit.gain - se;
+            let upper = fit.gain + se;
+            let yl = |z: f64| {
+                if lower > 0. {
+                    y(z + lower.log10())
+                } else {
+                    270.
+                }
+            };
+            scatter.push_str(&format!(
+                "<path d='M60,{} L610,{} L610,{} L60,{} Z' fill='#a9fff3' fill-opacity='0.30'/>",
+                y(lo + upper.log10()),
+                y(hi + upper.log10()),
+                yl(hi),
+                yl(lo)
+            ));
+        }
+        scatter.push_str(&format!(
+            "<path d='M60,{} L610,{}' fill='none' stroke='#a9fff3' stroke-width='2'/>",
+            y(lo + fit.gain.log10()),
+            y(hi + fit.gain.log10())
+        ));
+    }
+    scatter.push_str("</g>");
     for (i, p) in c.points.iter().enumerate() {
         let px = x(p.raw_ne_proxy_m3.log10());
         let py = y((p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio).log10());
@@ -453,6 +493,10 @@ fn table(state: &Cal) {
     }
     scatter.push_str("</svg>");
     el("cal-power-scatter").set_inner_html(&scatter);
+    text("cal-fit-summary",&match gain_fit {
+        Some(f)=>format!("Predicted = ({:.4}{}) × measured · {} included points, {} one-minute time groups. Band: ±1σ uncertainty of the fitted line (30% opacity); conditional on measured raw Ne and the plasma model. This is not a prediction interval and excludes systematic errors.",f.gain,f.standard_error.map(|se|format!(" ± {se:.4}")).unwrap_or_else(||"; uncertainty unavailable—include points from at least two one-minute fits".into()),f.points,f.time_clusters),
+        None=>"Include calibration points to fit predicted = gain × measured.".into(),
+    });
     markers(&c.app.borrow(), &c);
     let n = c.points.len();
     save(&c);
@@ -947,7 +991,7 @@ fn set_height(c: &Calibration, h: f64) {
         .gates
         .iter()
         .enumerate()
-        .filter(|(_, g)| g.result.is_some())
+        .filter(|(_, g)| g.result.is_some() && g.altitude_km >= lo && g.altitude_km <= hi)
         .min_by(|(_, a), (_, b)| {
             (a.altitude_km - h)
                 .abs()

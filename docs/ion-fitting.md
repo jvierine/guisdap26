@@ -302,3 +302,13 @@ Calibration details and point lists have fixed display areas to prevent page
 movement during editing. Parameter-map rectangle zoom selects time and
 altitude together. Tsys display is capped at twice the median positive native
 Tsys in the visible time window; off-scale markers retain awareness of outliers.
+
+The predicted-versus-measured calibration scatter includes a through-origin
+least-squares line using included points: predicted = gain × measured. Its
+30%-opacity band is ±1 standard error of the fitted mean line, computed with a
+one-minute-ion-fit cluster sandwich covariance and G/(G−1) correction. It needs
+at least two time groups; a single group still gives a gain but no uncertainty
+band. This conditions on measured x and the plasma model; it is not an
+errors-in-variables fit, full propagated physical uncertainty, or a prediction
+interval. Repeated points within a time group do not count as independent
+uncertainty samples. The line and error are also included in JSON export.

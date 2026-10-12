@@ -124,3 +124,79 @@ mod conversion_tests {
         assert!(short_lag_conversion(&mut a, 1e11, 0.).is_err());
     }
 }
+
+/// Through-origin least squares: predicted raw Ne = gain * measured raw Ne.
+/// Conditional standard error from independent time clusters. Points sharing
+/// the same one-minute ion fit must share a cluster. Neither x uncertainty nor
+/// systematic plasma-model errors are included.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GainFit {
+    pub gain: f64,
+    pub standard_error: Option<f64>,
+    pub points: usize,
+    pub time_clusters: usize,
+}
+pub fn fit_gain(points: &[(f64, f64, u64)]) -> Option<GainFit> {
+    if points.is_empty()
+        || points
+            .iter()
+            .any(|(x, y, _)| !x.is_finite() || !y.is_finite() || *x <= 0. || *y <= 0.)
+    {
+        return None;
+    }
+    let scale = points.iter().map(|p| p.0).fold(0., f64::max);
+    let xx = points.iter().map(|p| (p.0 / scale).powi(2)).sum::<f64>();
+    let xy = points
+        .iter()
+        .map(|p| (p.0 / scale) * (p.1 / scale))
+        .sum::<f64>();
+    let gain = xy / xx;
+    if !gain.is_finite() {
+        return None;
+    }
+    let mut scores = std::collections::BTreeMap::<u64, f64>::new();
+    for &(x, y, t) in points {
+        let x = x / scale;
+        let y = y / scale;
+        *scores.entry(t).or_default() += x * (y - gain * x);
+    }
+    let n = scores.len();
+    let standard_error = (n > 1).then(|| {
+        ((n as f64 / (n - 1) as f64) * scores.values().map(|s| s * s).sum::<f64>()).sqrt() / xx
+    });
+    Some(GainFit {
+        gain,
+        standard_error,
+        points: points.len(),
+        time_clusters: n,
+    })
+}
+#[cfg(test)]
+mod gain_tests {
+    use super::*;
+    #[test]
+    fn known_gain_and_scale_invariance() {
+        let p = [(1., 2., 0), (2., 4., 1), (3., 6., 2)];
+        let f = fit_gain(&p).unwrap();
+        assert_eq!(f.gain, 2.);
+        assert_eq!(f.standard_error, Some(0.));
+        let q = p.map(|(x, y, t)| (x * 1e12, y * 1e12, t));
+        assert_eq!(fit_gain(&q).unwrap().gain, 2.);
+    }
+    #[test]
+    fn correlated_repeated_points_do_not_reduce_uncertainty() {
+        let p = [(1., 1., 0), (1., 3., 1)];
+        let f = fit_gain(&p).unwrap();
+        assert!((f.standard_error.unwrap() - 1.).abs() < 1e-12);
+        let repeated = [p[0], p[0], p[1], p[1]];
+        assert_eq!(
+            fit_gain(&repeated).unwrap().standard_error,
+            f.standard_error
+        );
+        assert!(fit_gain(&[(1., 1., 0), (1., 3., 0)])
+            .unwrap()
+            .standard_error
+            .is_none());
+        assert!(fit_gain(&[(0., 1., 0)]).is_none());
+    }
+}
