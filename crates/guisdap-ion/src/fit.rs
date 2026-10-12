@@ -114,19 +114,38 @@ impl FitProblem {
             ion_collision_s: p[4],
         }
     }
-    fn residual(&self, x: &DVector<f64>, indices: &[usize]) -> Result<DVector<f64>> {
+    fn residual(
+        &self,
+        x: &DVector<f64>,
+        indices: &[usize],
+        whitening: Option<&DMatrix<f64>>,
+    ) -> Result<DVector<f64>> {
         let pred = self.predict(self.state(x, indices))?;
-        Ok(DVector::from_iterator(
+        let raw = DVector::from_iterator(
             2 * pred.len(),
-            self.measurements.iter().zip(pred).flat_map(|(m, p)| {
-                [
-                    (p.re - m.value.re) / m.sigma[0],
-                    (p.im - m.value.im) / m.sigma[1],
-                ]
-            }),
-        ))
+            self.measurements
+                .iter()
+                .zip(pred)
+                .flat_map(|(m, p)| [p.re - m.value.re, p.im - m.value.im]),
+        );
+        if let Some(w) = whitening {
+            Ok(w * raw)
+        } else {
+            Ok(DVector::from_iterator(
+                raw.len(),
+                raw.iter()
+                    .enumerate()
+                    .map(|(i, r)| r / self.measurements[i / 2].sigma[i % 2]),
+            ))
+        }
     }
-    fn jacobian(&self, x: &DVector<f64>, ind: &[usize]) -> Result<DMatrix<f64>> {
+
+    fn jacobian(
+        &self,
+        x: &DVector<f64>,
+        ind: &[usize],
+        whitening: Option<&DMatrix<f64>>,
+    ) -> Result<DMatrix<f64>> {
         let mut j = DMatrix::zeros(self.measurements.len() * 2, ind.len());
         for i in 0..ind.len() {
             let mut a = x.clone();
@@ -135,12 +154,62 @@ impl FitProblem {
             b[i] -= 1e-4;
             j.set_column(
                 i,
-                &((self.residual(&a, ind)? - self.residual(&b, ind)?) / 2e-4),
+                &((self.residual(&a, ind, whitening)? - self.residual(&b, ind, whitening)?) / 2e-4),
             );
         }
         Ok(j)
     }
     pub fn solve(&self, initial: PlasmaState) -> Result<FitResult> {
+        self.solve_weighted(initial, None)
+    }
+    /// Refit using a fixed model-based covariance in physical measurement units.
+    /// Cholesky whitening preserves every measured lag; no SVD or eigenvalue clipping.
+    pub fn solve_with_covariance(
+        &self,
+        initial: PlasmaState,
+        covariance: &DMatrix<f64>,
+    ) -> Result<FitResult> {
+        let n = 2 * self.measurements.len();
+        ensure!(
+            covariance.shape() == (n, n) && covariance.iter().all(|v| v.is_finite()),
+            "invalid measurement covariance"
+        );
+        let scale = covariance.amax().max(f64::MIN_POSITIVE);
+        ensure!(
+            (covariance - covariance.transpose()).amax() <= scale * 1e-10,
+            "asymmetric measurement covariance"
+        );
+        let chol = covariance
+            .clone()
+            .cholesky()
+            .ok_or_else(|| anyhow::anyhow!("measurement covariance is not positive definite"))?;
+        let whitening = chol
+            .l()
+            .try_inverse()
+            .ok_or_else(|| anyhow::anyhow!("singular whitening factor"))?;
+        self.solve_weighted(initial, Some(&whitening))
+    }
+    /// Feasible GLS: estimate parameters, build covariance once, then hold it fixed
+    /// throughout the second solve. Caller is responsible for validating the first pass.
+    pub fn solve_two_pass<F>(
+        &self,
+        initial: PlasmaState,
+        estimate: F,
+    ) -> Result<(FitResult, FitResult, DMatrix<f64>)>
+    where
+        F: FnOnce(&FitResult) -> Result<DMatrix<f64>>,
+    {
+        let first = self.solve(initial)?;
+        let covariance = estimate(&first)?;
+        let mut second = self.solve_with_covariance(first.plasma, &covariance)?;
+        self.model_uncertainty(&mut second)?;
+        Ok((first, second, covariance))
+    }
+    fn solve_weighted(
+        &self,
+        initial: PlasmaState,
+        whitening: Option<&DMatrix<f64>>,
+    ) -> Result<FitResult> {
         self.model.validate()?;
         ensure!(
             self.frequency_hz.len() >= 3 && self.frequency_hz.windows(2).all(|a| a[1] > a[0]),
@@ -188,14 +257,14 @@ impl FitProblem {
         for (j, &i) in ind.iter().enumerate() {
             x[j] = x[j].clamp(bounds[i].0, bounds[i].1);
         }
-        let mut r = self.residual(&x, &ind)?;
+        let mut r = self.residual(&x, &ind, whitening)?;
         let mut cost = r.norm_squared();
         let mut damping = 1e-3;
         let mut converged = false;
         let mut iterations = 0;
         for iteration in 0..self.settings.max_iterations {
             iterations = iteration + 1;
-            let j = self.jacobian(&x, &ind)?;
+            let j = self.jacobian(&x, &ind, whitening)?;
             let h = j.transpose() * &j;
             let g = j.transpose() * &r;
             if g.amax() < 1e-7 {
@@ -210,12 +279,25 @@ impl FitProblem {
                 damping *= 10.;
                 continue;
             };
+            let scaled_gradient = (0..n)
+                .map(|k| g[k].abs() / h[(k, k)].max(1e-24).sqrt())
+                .fold(0., f64::max)
+                / (1. + cost).sqrt();
             let step = chol.solve(&(-g));
             let mut candidate = &x + &step;
             for (k, &i) in ind.iter().enumerate() {
                 candidate[k] = candidate[k].clamp(bounds[i].0, bounds[i].1);
             }
-            let next = self.residual(&candidate, &ind)?;
+            let next = match self.residual(&candidate, &ind, whitening) {
+                Ok(r) if r.iter().all(|x| x.is_finite()) => r,
+                _ => {
+                    damping *= 8.;
+                    if damping > 1e16 {
+                        break;
+                    }
+                    continue;
+                }
+            };
             let nextcost = next.norm_squared();
             if nextcost < cost {
                 let change = cost - nextcost;
@@ -224,7 +306,7 @@ impl FitProblem {
                 r = next;
                 cost = nextcost;
                 damping = (damping / 3.).max(1e-12);
-                if change < 1e-7 * (1. + cost) && effective < 1e-4 {
+                if change < 1e-7 * (1. + cost) && effective < 1e-4 && scaled_gradient < 1e-5 {
                     converged = true;
                     break;
                 }
@@ -236,7 +318,7 @@ impl FitProblem {
             }
         }
         let plasma = self.state(&x, &ind);
-        let j = self.jacobian(&x, &ind)?;
+        let j = self.jacobian(&x, &ind, whitening)?;
         let h = j.transpose() * j;
         let inverse = h.cholesky().map(|c| c.inverse());
         let physical = [
@@ -332,7 +414,7 @@ impl FitProblem {
                 _ => unreachable!(),
             }),
         );
-        let j = self.jacobian(&x, &ind)?;
+        let j = self.jacobian(&x, &ind, None)?;
         let Some(chol) = (j.transpose() * &j).cholesky() else {
             result.status = "singular".into();
             result.standard_error = [None; 5];

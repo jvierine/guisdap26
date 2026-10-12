@@ -269,3 +269,80 @@ fn model_band_propagates_correlations_ties_and_shared_response_averages() {
         assert!(fit.model_curve.iter().all(|p| p.standard_error.is_none()));
     }
 }
+
+#[test]
+fn full_covariance_diagonal_matches_existing_weights_and_rejects_singular() {
+    let truth = PlasmaState {
+        electron_density_m3: 3e11,
+        ion_temperature_k: 900.,
+        electron_temperature_k: 1900.,
+        velocity_m_s: -230.,
+        ion_collision_s: 0.,
+    };
+    let p = problem(truth, false);
+    let n = p.measurements.len() * 2;
+    let covariance = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
+        n,
+        p.measurements.iter().flat_map(|m| m.sigma.map(|s| s * s)),
+    ));
+    let (first, second, stored) = p.solve_two_pass(truth, |_| Ok(covariance.clone())).unwrap();
+    assert!((first.chi_square - second.chi_square).abs() < 1e-10);
+    assert!((second.plasma.electron_density_m3 / truth.electron_density_m3 - 1.).abs() < 1e-6);
+    assert_eq!(stored, covariance);
+    assert!(p
+        .solve_with_covariance(truth, &nalgebra::DMatrix::zeros(n, n))
+        .is_err());
+}
+
+#[test]
+fn two_ion_fit_recovers_from_cold_and_displaced_initial_guesses() {
+    let truth = PlasmaState {
+        electron_density_m3: 2e11,
+        ion_temperature_k: 750.,
+        electron_temperature_k: 1400.,
+        velocity_m_s: -180.,
+        ion_collision_s: 600.,
+    };
+    let mut p = problem(truth, true);
+    p.model.ions = vec![
+        IonSpecies {
+            mass_amu: 16.,
+            fraction: 0.15,
+        },
+        IonSpecies {
+            mass_amu: 30.5,
+            fraction: 0.85,
+        },
+    ];
+    p.settings.max_iterations = 160;
+    let measured = p.predict(truth).unwrap();
+    for (m, y) in p.measurements.iter_mut().zip(measured) {
+        m.value = y;
+    }
+    let cold = PlasmaState {
+        electron_density_m3: 1e11,
+        ion_temperature_k: 80.,
+        electron_temperature_k: 400.,
+        velocity_m_s: 250.,
+        ion_collision_s: 3000.,
+    };
+    let fits = [
+        cold,
+        PlasmaState {
+            ion_temperature_k: 500.,
+            electron_temperature_k: 1000.,
+            velocity_m_s: 0.,
+            ion_collision_s: 300.,
+            ..truth
+        },
+    ]
+    .map(|seed| p.solve(seed).unwrap());
+    let best = fits
+        .iter()
+        .min_by(|a, b| a.chi_square.total_cmp(&b.chi_square))
+        .unwrap();
+    assert_eq!(best.status, "converged", "{best:?}");
+    assert!((best.plasma.ion_temperature_k / truth.ion_temperature_k - 1.).abs() < 1e-3);
+    assert!((best.plasma.electron_density_m3 / truth.electron_density_m3 - 1.).abs() < 1e-3);
+    assert_eq!(best.predicted.len(), 41);
+}

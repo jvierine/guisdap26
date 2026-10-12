@@ -37,6 +37,14 @@ pub struct Config {
     #[serde(default)]
     pub streaming: bool,
     #[serde(default)]
+    pub native_range_below_km: Option<f64>,
+    #[serde(default)]
+    pub model_selection_below_km: Option<f64>,
+    #[serde(default)]
+    pub warm_start_index: Option<PathBuf>,
+    #[serde(default)]
+    pub native_slant_edges_km: Vec<f64>,
+    #[serde(default)]
     pub live_export: Option<PathBuf>,
 }
 #[derive(Clone)]
@@ -250,7 +258,26 @@ fn read_record(meta: &FrameMeta, exp: &Experiment, cfg: &Config) -> Result<Recor
         data,
     })
 }
-fn fit_gate(records: &[Record], exp: &Experiment, cfg: &Config, lo: f64, hi: f64) -> Result<Gate> {
+fn fit_gate(
+    records: &[Record],
+    exp: &Experiment,
+    cfg: &Config,
+    lo: f64,
+    hi: f64,
+    seeds: &[PlasmaState],
+) -> Result<Gate> {
+    let native_bounds = cfg
+        .altitude_edges_km
+        .iter()
+        .position(|h| (*h - lo).abs() < 1e-8)
+        .and_then(|i| cfg.native_slant_edges_km.get(i..i + 2));
+    let (lo, hi) = if let Some(r) = native_bounds {
+        let elevation =
+            records.iter().map(|r| r.meta.elevation_deg).sum::<f64>() / records.len() as f64;
+        (altitude_km(r[0], elevation), altitude_km(r[1], elevation))
+    } else {
+        (lo, hi)
+    };
     let altitude = (lo + hi) / 2.;
     let oxygen =
         1. / (1. + (-(altitude - cfg.composition_transition_km) / cfg.composition_scale_km).exp());
@@ -269,6 +296,7 @@ fn fit_gate(records: &[Record], exp: &Experiment, cfg: &Config, lo: f64, hi: f64
         electron_collision_s: 0.,
     };
     let settings = FitSettings {
+        max_iterations: 160,
         tie_electron_ion_temperature: altitude < cfg.tie_temperature_below_km,
         fit_collision_rate: altitude < cfg.fit_collisions_below_km,
         ..Default::default()
@@ -283,12 +311,23 @@ fn fit_gate(records: &[Record], exp: &Experiment, cfg: &Config, lo: f64, hi: f64
         let selected: Vec<_> = (0..g.count)
             .filter(|&j| {
                 let r = g.range_km + j as f64 * g.step_km;
-                records.iter().all(|rec| {
-                    let h = altitude_km(r, rec.meta.elevation_deg);
-                    h >= lo && h < hi
-                })
+                if let Some(bounds) = native_bounds {
+                    r >= bounds[0] - 1e-8 && r < bounds[1] - 1e-8
+                } else {
+                    records.iter().all(|rec| {
+                        let h = altitude_km(r, rec.meta.elevation_deg);
+                        h >= lo && h < hi
+                    })
+                }
             })
             .collect();
+        ensure!(
+            native_bounds.is_none() || selected.len() <= 1,
+            "native range selection combined {} samples at lag={} us, step={} km, bin={lo}..{hi}",
+            selected.len(),
+            g.lag_s * 1e6,
+            g.step_km
+        );
         if selected.is_empty() {
             continue;
         }
@@ -387,19 +426,90 @@ fn fit_gate(records: &[Record], exp: &Experiment, cfg: &Config, lo: f64, hi: f64
         velocity_m_s: 0.,
         ion_collision_s: if altitude < 110. { 3000. } else { 300. },
     };
-    let mut candidates = vec![];
-    for ratio in [0.7, 1.5] {
-        let mut p = initial;
-        p.ion_temperature_k *= ratio;
-        p.electron_temperature_k *= ratio;
-        if let Ok(fit) = problem.solve(p) {
-            candidates.push(fit);
+    let select_model = cfg.model_selection_below_km.is_some_and(|h| altitude < h);
+    let mut variants = vec![problem.clone()];
+    if select_model {
+        if problem.settings.fit_collision_rate {
+            let mut zero = problem.clone();
+            zero.settings.fit_collision_rate = false;
+            zero.settings.fixed_collision_s = 0.;
+            variants.push(zero);
+        }
+        if !problem.settings.tie_electron_ion_temperature {
+            let tied: Vec<_> = variants
+                .iter()
+                .map(|p| {
+                    let mut p = p.clone();
+                    p.settings.tie_electron_ion_temperature = true;
+                    p
+                })
+                .collect();
+            variants.extend(tied);
         }
     }
-    if let Some(mut best) = candidates
-        .into_iter()
-        .min_by(|a, b| a.chi_square.total_cmp(&b.chi_square))
+    let mut candidates = vec![];
+    for candidate in variants {
+        let mut starts = Vec::new();
+        for ratio in [0.7, 1.5] {
+            let mut p = initial;
+            p.ion_temperature_k *= ratio;
+            p.electron_temperature_k *= ratio;
+            starts.push(p);
+        }
+        starts.extend_from_slice(seeds);
+        for p in starts {
+            if let Ok(fit) = candidate.solve(p) {
+                let penalty = if select_model {
+                    fit.free_parameter_indices.len() as f64
+                        * (2. * candidate.measurements.len() as f64).ln()
+                } else {
+                    0.
+                };
+                if fit.chi_square.is_finite() {
+                    candidates.push((fit.chi_square + penalty, candidate.clone(), fit));
+                }
+            }
+        }
+    }
+    if !select_model {
+        let suspicious = candidates
+            .iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .is_none_or(|(_, _, f)| {
+                f.status != "converged"
+                    || f.reduced_chi_square > 9.
+                    || (altitude >= 120. && f.plasma.ion_temperature_k < 250.)
+            });
+        if suspicious {
+            let density = candidates
+                .iter()
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, _, f)| f.plasma.electron_density_m3)
+                .unwrap_or(initial.electron_density_m3);
+            for (ti, te, velocity, collision) in [
+                (350., 700., -250., 30.),
+                (700., 1400., 250., 3000.),
+                (1500., 3000., 0., 100.),
+                (3000., 6000., 0., 10000.),
+            ] {
+                let seed = PlasmaState {
+                    electron_density_m3: density,
+                    ion_temperature_k: ti,
+                    electron_temperature_k: te,
+                    velocity_m_s: velocity,
+                    ion_collision_s: collision,
+                };
+                if let Ok(f) = problem.solve(seed) {
+                    if f.chi_square.is_finite() {
+                        candidates.push((f.chi_square, problem.clone(), f));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, problem, mut best)) = candidates.into_iter().min_by(|a, b| a.0.total_cmp(&b.0))
     {
+        gate.settings = problem.settings.clone();
         problem.temporal_uncertainty(&mut best, &samples)?;
         problem.model_uncertainty(&mut best)?;
         if best.status == "converged" && gate.first_lag_signal_to_noise.is_none_or(|s| s < 3.) {
@@ -483,7 +593,7 @@ pub fn run(path: &Path) -> Result<()> {
         let gates = pool.install(|| {
             cfg.altitude_edges_km
                 .par_windows(2)
-                .map(|h| fit_gate(&records, &exp, &cfg, h[0], h[1]))
+                .map(|h| fit_gate(&records, &exp, &cfg, h[0], h[1], &[]))
                 .collect::<Result<Vec<_>>>()
         })?;
         let good = gates.iter().filter(|g| g.status == "converged").count();

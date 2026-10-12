@@ -322,3 +322,27 @@ reference × correction values. JSON export calls the fit `magic_constant_fit`;
 its `gain` field is C. Existing relative quantities remain provenance fields.
 Ion datasets expose the constant actually used and antenna efficiency in
 `calibration` metadata, separately from estimates that have not been applied.
+
+### Hardened production refit (v3)
+Coarse range gates are refitted first (60 s, then 15 s), followed by native
+range gates (60 s, then 15 s), with 128 Rayon workers per dataset. Original
+products remain available. Publication requires matching time/range grids,
+measurement/model degrees of freedom, no lost fits, and a non-worsened chi-square
+for every prior valid fit. The processing view exposes in-progress datasets;
+the normal resolution entries are promoted only after validation.
+
+The fitter keeps its original two starts and adds the prior solution at the
+same cell, the previous time at that altitude, adjacent altitude solutions,
+and the newly fitted preceding altitude. These are initial guesses, not a
+smoothing prior. Failed, boundary, low-Ti, and high-residual solutions trigger
+four independent temperature/velocity/collision starts. All finite solutions
+compete on the same objective. The iteration limit is 160. Small steps/cost
+changes alone no longer establish convergence: a scaled-gradient check is also
+required. Invalid trial predictions are rejected rather than discarding a start.
+
+Calibration stays at 0.7, the fixed two-ion composition and existing collision/
+temperature constraints stay unchanged, and optional nested-model selection is
+disabled. The existing temporal-cluster uncertainty remains in production; the
+separate full-covariance/two-pass API is not yet a BEATA self-noise implementation.
+The native range selection uses physical slant-range cell boundaries before
+mapping to altitude, retaining exactly one native range cell below 250 km.
