@@ -1,4 +1,5 @@
 //! Ion-fit inspection. All interaction and plotting run in Rust/WASM.
+mod colors;
 mod instruments;
 mod raster;
 use super::{el, error, json, text};
@@ -576,6 +577,7 @@ fn acf(v: &Viewer, component: usize) -> String {
     s
 }
 fn render(v: &Viewer) {
+    colors::sync(v);
     text("fit-uncertainty", &v.data.uncertainty);
     text("fit-assumptions", &v.data.limitations.join(". "));
     text("fit-calibration-used",&v.data.calibration.as_ref().map(|c|format!("Magic constant used: {:.4} · antenna efficiency: {:.3} · these values produced the displayed fits; plasma-line calibration estimates are not automatically applied.",c.magic_constant,c.antenna_efficiency)).unwrap_or_else(||"Magic constant used: not recorded in this product.".into()));
@@ -1075,6 +1077,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
     status_view(&state.borrow());
     load_detail(state.clone());
     settings_drag()?;
+    colors::install(state.clone())?;
     for (id, open) in [("fit-settings-open", true), ("fit-settings-close", false)] {
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
             if open {
