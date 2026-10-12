@@ -950,6 +950,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
     render(&state.borrow());
     status_view(&state.borrow());
     load_detail(state.clone());
+    settings_drag()?;
     for (id, open) in [("fit-settings-open", true), ("fit-settings-close", false)] {
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
             if open {
@@ -1259,4 +1260,91 @@ fn selection(region: Option<(f64, f64, f64, f64)>) {
     for i in 0..5 {
         el(&format!("fit-selection-{i}")).set_inner_html(&markup);
     }
+}
+
+// Window-local UI state; no scientific state or global mutable variables.
+fn move_settings(x: f64, y: f64) {
+    let panel = el("fit-settings");
+    let rect = panel.get_bounding_client_rect();
+    let window = web_sys::window().unwrap();
+    let width = window
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1024.);
+    let height = window
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(768.);
+    let x = x.clamp(0., (width - rect.width()).max(0.));
+    let y = y.clamp(0., (height - rect.height()).max(0.));
+    let _ = panel.set_attribute("style", &format!("left:{x}px;top:{y}px;right:auto"));
+}
+fn settings_drag() -> Result<(), JsValue> {
+    let drag = Rc::new(RefCell::new(None::<(i32, f64, f64)>));
+    for kind in ["pointerdown", "pointermove", "pointerup", "pointercancel"] {
+        let drag = drag.clone();
+        let cb = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
+            move |event: web_sys::PointerEvent| {
+                let handle = el("fit-settings-drag");
+                if kind == "pointerdown" {
+                    if event.button() != 0 {
+                        return;
+                    }
+                    let r = el("fit-settings").get_bounding_client_rect();
+                    *drag.borrow_mut() = Some((
+                        event.pointer_id(),
+                        event.client_x() as f64 - r.x(),
+                        event.client_y() as f64 - r.y(),
+                    ));
+                    let _ = handle.set_pointer_capture(event.pointer_id());
+                    event.prevent_default();
+                } else if let Some((pointer, dx, dy)) = *drag.borrow() {
+                    if pointer != event.pointer_id() {
+                        return;
+                    }
+                    if kind == "pointermove" {
+                        move_settings(event.client_x() as f64 - dx, event.client_y() as f64 - dy);
+                    } else {
+                        let _ = handle.release_pointer_capture(pointer);
+                    }
+                }
+                if kind == "pointerup" || kind == "pointercancel" {
+                    *drag.borrow_mut() = None;
+                }
+            },
+        );
+        el("fit-settings-drag")
+            .add_event_listener_with_callback(kind, cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+    let keys =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
+            let step = if event.shift_key() { 40. } else { 10. };
+            let (dx, dy) = match event.key().as_str() {
+                "ArrowLeft" => (-step, 0.),
+                "ArrowRight" => (step, 0.),
+                "ArrowUp" => (0., -step),
+                "ArrowDown" => (0., step),
+                _ => return,
+            };
+            event.prevent_default();
+            let r = el("fit-settings").get_bounding_client_rect();
+            move_settings(r.x() + dx, r.y() + dy);
+        });
+    el("fit-settings-drag")
+        .add_event_listener_with_callback("keydown", keys.as_ref().unchecked_ref())?;
+    keys.forget();
+    let resize = Closure::<dyn FnMut()>::new(move || {
+        if !el("fit-settings").has_attribute("hidden") {
+            let r = el("fit-settings").get_bounding_client_rect();
+            move_settings(r.x(), r.y());
+        }
+    });
+    web_sys::window()
+        .unwrap()
+        .add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
+    resize.forget();
+    Ok(())
 }
