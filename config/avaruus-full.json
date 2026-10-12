@@ -1,0 +1,9 @@
+{
+  "roots": [
+    "/nfs/revontuli/data/oliver/02112022/beata_cp1_2.2u_AA@uhf"
+  ],
+  "output": "/home/j/data/guisdap/2022-11-02-ion-inputs",
+  "start": "2022-11-02T00:00:00Z",
+  "end": "2022-11-03T00:00:00Z",
+  "threads": 128
+}

@@ -1,1 +1,1 @@
-{"data_root":"data/2022-11-02-v5/"}
+{"data_root":"data/2022-11-02-plasma-full-60s-v1/","datasets":[{"data_root":"data/2022-11-02-plasma-full-15s-v1/","label":"15 seconds"},{"data_root":"data/2022-11-02-plasma-full-60s-v1/","label":"60 seconds"}]}

@@ -164,3 +164,24 @@ velocity with fixed colour limits and logarithmic Ne. Flagged fits are hatched;
 singular/missing fits are blank. Separate controls choose the diagnostic altitude
 and the lower/upper displayed altitude bounds. Display limits never filter or
 refit the stored measurements.
+
+
+## Whole-dataset streaming products
+
+`run-study` prepares lightweight ion inputs, then fits all UTC-aligned windows at
+15 s and 60 s using 128 configurable workers. The browser overview carries only
+parameters, uncertainties, flags and raw Ne. Native lag measurements, covariance
+and model curves are loaded from immutable per-interval JSON on selection; the
+complete equivalent remains in per-interval HDF5. Cache keys include source
+metadata and numerical configuration, excluding publication paths and thread count.
+
+Five of the 958 15 s windows contain two native records: their fits are explicitly
+`insufficient_records`, while raw power remains available. All 240 one-minute
+windows meet the record-count requirement. A completed interval can still contain
+nonconverged, boundary or weak-signal fits; the browser preserves those flags.
+
+The extra raw-Ne row is the signed 10 µs short-lag proxy averaged into the fit
+altitude bins, not fitted Ne or a newly inferred zero-lag estimate. Its uncertainty
+conservatively treats range samples as correlated and temporal samples as
+independent, with empirical temporal variance as a lower bound. Negative estimates
+remain in HDF5/JSON and are blank on logarithmic colour scales.

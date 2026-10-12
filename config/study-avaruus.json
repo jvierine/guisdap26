@@ -1,0 +1,12 @@
+{
+ "dataset":"2022-11-02",
+ "data_sources":["/nfs/revontuli/data/oliver/02112022/beata_cp1_2.2u_AA@uhf"],
+ "start":"2022-11-02T00:00:00Z",
+ "end":"2022-11-03T00:00:00Z",
+ "worker_threads":128,
+ "work_root":"/home/j/data/guisdap",
+ "publication_root":"/srv/guisdap/data",
+ "fit_template":"config/ion-fit-avaruus.json",
+ "integrations_s":[15,60],
+ "gui_config":"/srv/guisdap/config.json"
+}

@@ -1,1 +1,1 @@
-{"data_url":"data/2022-11-02-ionfit-15s-v1/ion-fits.json"}
+{"datasets":[{"label":"15 seconds","integration_s":15,"data_url":"data/2022-11-02-ionfit-full-15s-v2/index.json"},{"label":"1 minute","integration_s":60,"data_url":"data/2022-11-02-ionfit-full-60s-v2/index.json"}],"study_status_url":"data/study-status.json"}

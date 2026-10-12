@@ -12,9 +12,18 @@ use web_sys::{
 #[derive(Deserialize)]
 struct Config {
     data_root: String,
+    #[serde(default)]
+    datasets: Vec<PlasmaDataset>,
+}
+#[derive(Deserialize)]
+struct PlasmaDataset {
+    label: String,
+    data_root: String,
 }
 #[derive(Deserialize)]
 struct Frame {
+    #[serde(default)]
+    source_count: usize,
     id: String,
     start_unix: f64,
     end_unix: f64,
@@ -29,6 +38,8 @@ struct Manifest {
     frames: Vec<Frame>,
     ion_range_km: Vec<f64>,
     decoded_range_km: Vec<f64>,
+    #[serde(default)]
+    overview_root: String,
 }
 struct App {
     root: String,
@@ -39,6 +50,8 @@ struct App {
     power_sigma: Vec<f32>,
     decoded: Vec<f32>,
     selected: usize,
+    view_start: f64,
+    view_end: f64,
     decoded_selected: Option<usize>,
     raw_view: bool,
     percentile: f64,
@@ -78,7 +91,7 @@ fn report(e: JsValue) {
 }
 async fn response(url: &str) -> Result<web_sys::Response, JsValue> {
     let request = web_sys::RequestInit::new();
-    if url.ends_with("config.json") {
+    if url.ends_with("config.json") || url.ends_with("index.json") || url.ends_with("status.json") {
         request.set_cache(web_sys::RequestCache::NoCache);
     }
     let r: web_sys::Response = JsFuture::from(
@@ -274,7 +287,45 @@ vec3(0.940015,0.975158,0.131326));
 }
 fn overview(a: &App) -> Result<(), JsValue> {
     let n = a.m.frames.len();
-    let cursor = Some((a.selected as f32 + 0.5) / n as f32);
+    let frame = &a.m.frames[a.selected];
+    let cursor = Some(
+        (((frame.start_unix + frame.end_unix) / 2. - a.view_start) / (a.view_end - a.view_start))
+            as f32,
+    );
+    let dt = a.m.frames[0].end_unix - a.m.frames[0].start_unix;
+    let width = ((a.view_end - a.view_start) / dt).ceil().max(1.) as usize;
+    let columns: Vec<Option<usize>> = (0..width)
+        .map(|i| {
+            let t = a.view_start + (a.view_end - a.view_start) * (i as f64 + 0.5) / width as f64;
+            let j = a.m.frames.partition_point(|f| f.end_unix <= t);
+            a.m.frames.get(j).filter(|f| f.start_unix <= t).map(|_| j)
+        })
+        .collect();
+    let axes = doc().get_elements_by_class_name("time-axis");
+    for i in 0..axes.length() {
+        axes.item(i).unwrap().set_inner_html(&format!(
+            "<span>{}</span><span>UTC · gaps left empty</span><span>{}</span>",
+            utc(a.view_start),
+            utc(a.view_end)
+        ));
+    }
+    text(
+        "plasma-window",
+        &format!("{}–{} UTC", utc(a.view_start), utc(a.view_end)),
+    );
+    let time: HtmlInputElement = el("time").dyn_into()?;
+    time.set_min(
+        &a.m.frames
+            .partition_point(|f| f.end_unix <= a.view_start)
+            .min(n - 1)
+            .to_string(),
+    );
+    time.set_max(
+        &a.m.frames
+            .partition_point(|f| f.start_unix < a.view_end)
+            .saturating_sub(1)
+            .to_string(),
+    );
     let data = if a.raw_view { &a.raw } else { &a.broad };
     // Convert band/frequency/time to band/time/frequency before frequency merging.
     let mut all_history = Vec::new();
@@ -305,10 +356,17 @@ fn overview(a: &App) -> Result<(), JsValue> {
     let bounds = [[47., 221.], [128., 302.], [209., 383.], [290., 464.]];
     let elevation = a.m.frames[a.selected].elevation_deg;
     for (gate, (history, bins)) in all_history.iter().enumerate() {
+        let visible: Vec<f32> = (0..*bins)
+            .flat_map(|f| {
+                columns
+                    .iter()
+                    .map(move |t| t.map_or(f32::NAN, |t| history[f * n + t]))
+            })
+            .collect();
         draw(
             &format!("broad{gate}"),
-            history,
-            n,
+            &visible,
+            width,
             *bins,
             a.percentile,
             cursor,
@@ -342,12 +400,16 @@ fn overview(a: &App) -> Result<(), JsValue> {
             .collect();
     let mut power = vec![];
     for &r in &indices {
-        power.extend_from_slice(&a.power[r * n..(r + 1) * n]);
+        power.extend(
+            columns
+                .iter()
+                .map(|t| t.map_or(f32::NAN, |t| a.power[r * n + t])),
+        );
     }
     draw(
         "power",
         &power,
-        n,
+        width,
         indices.len(),
         a.percentile,
         cursor,
@@ -570,9 +632,11 @@ async fn select(state: State, index: usize) -> Result<(), JsValue> {
     text(
         "frameinfo",
         &format!(
-            "Integration {} / {} · {:.2} MW",
+            "Integration {} / {} · {} / {:.0} native records · {:.2} MW",
             index + 1,
             a.m.frames.len(),
+            f.source_count.max(1),
+            ((f.end_unix - f.start_unix) / 5.).max(1.),
             f.transmitter_w / 1e6
         ),
     );
@@ -610,10 +674,36 @@ fn on(
 #[wasm_bindgen]
 pub async fn start() -> Result<(), JsValue> {
     let cfg: Config = json("config.json").await?;
-    let root = if cfg.data_root.ends_with('/') {
-        cfg.data_root
+    let query = web_sys::window().unwrap().location().search()?;
+    let param = |key: &str| {
+        query.trim_start_matches('?').split('&').find_map(|part| {
+            part.strip_prefix(&format!("{key}="))
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+    };
+    let chosen = param("resolution").unwrap_or(0.) as usize;
+    if let Some(selector) = doc().get_element_by_id("plasma-resolution") {
+        selector.set_inner_html(
+            &cfg.datasets
+                .iter()
+                .enumerate()
+                .map(|(i, d)| format!("<option value='{i}'>{}</option>", d.label))
+                .collect::<String>(),
+        );
+        selector
+            .clone()
+            .dyn_into::<HtmlSelectElement>()?
+            .set_value(&chosen.to_string());
+    }
+    let data_root = cfg
+        .datasets
+        .get(chosen)
+        .map_or(cfg.data_root.as_str(), |d| d.data_root.as_str())
+        .to_string();
+    let root = if data_root.ends_with('/') {
+        data_root
     } else {
-        cfg.data_root + "/"
+        data_root + "/"
     };
     let m: Manifest = json(&(root.clone() + "index.json")).await?;
     if m.schema != "beata22-quicklook-v5"
@@ -623,10 +713,18 @@ pub async fn start() -> Result<(), JsValue> {
     {
         return Err(error("unsupported or empty dataset"));
     }
-    let broad = floats(&(root.clone() + "broad-excess.f32")).await?;
-    let raw = floats(&(root.clone() + "broad-raw.f32")).await?;
-    let power = floats(&(root.clone() + "ion-short-raw-ne.f32")).await?;
-    let power_sigma = floats(&(root.clone() + "ion-short-raw-ne-sigma.f32")).await?;
+    let broad = floats(&(root.clone() + &m.overview_root + "broad-excess.f32")).await?;
+    let raw = floats(&(root.clone() + &m.overview_root + "broad-raw.f32")).await?;
+    let power = floats(&(root.clone() + &m.overview_root + "ion-short-raw-ne.f32")).await?;
+    let power_sigma =
+        floats(&(root.clone() + &m.overview_root + "ion-short-raw-ne-sigma.f32")).await?;
+    if let Some(button) = doc().get_element_by_id("refresh-data") {
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let _ = web_sys::window().unwrap().location().reload();
+        });
+        button.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
     let n = m.frames.len();
     if broad.len() != 800 * n
         || raw.len() != 800 * n
@@ -663,11 +761,17 @@ pub async fn start() -> Result<(), JsValue> {
     el("time")
         .dyn_into::<HtmlInputElement>()?
         .set_max(&(n - 1).to_string());
+    let target = param("time").unwrap_or(1667408700.1);
     let initial = m
         .frames
-        .iter()
-        .position(|f| utc(f.end_unix).starts_with("17:05:30"))
-        .unwrap_or(n / 2);
+        .partition_point(|f| f.end_unix <= target)
+        .min(n - 1);
+    let view_start = param("from")
+        .unwrap_or(first.start_unix)
+        .clamp(first.start_unix, last.end_unix - dt);
+    let view_end = param("to")
+        .unwrap_or(last.end_unix)
+        .clamp(view_start + dt, last.end_unix);
     let state = Rc::new(RefCell::new(App {
         root,
         m,
@@ -677,6 +781,8 @@ pub async fn start() -> Result<(), JsValue> {
         power_sigma,
         decoded: vec![],
         selected: initial,
+        view_start,
+        view_end,
         decoded_selected: None,
         raw_view: false,
         percentile: 0.995,
@@ -691,6 +797,47 @@ pub async fn start() -> Result<(), JsValue> {
         native: vec![],
         cache: std::collections::VecDeque::new(),
     }));
+    if doc().get_element_by_id("plasma-resolution").is_some() {
+        let s = state.clone();
+        on("plasma-resolution", "change", move |_| {
+            let a = s.borrow();
+            let resolution = el("plasma-resolution")
+                .dyn_into::<HtmlSelectElement>()
+                .unwrap()
+                .value();
+            let _ = web_sys::window().unwrap().location().set_search(&format!(
+                "?resolution={resolution}&from={}&to={}&time={}",
+                a.view_start,
+                a.view_end,
+                a.m.frames[a.selected].start_unix + 0.1
+            ));
+        })?;
+    }
+    for (id, factor) in [
+        ("plasma-zoom-in", 0.5),
+        ("plasma-zoom-out", 2.),
+        ("plasma-view-all", 0.),
+    ] {
+        let s = state.clone();
+        on(id, "click", move |_| {
+            pause(&s);
+            let mut a = s.borrow_mut();
+            let first = a.m.frames[0].start_unix;
+            let last = a.m.frames.last().unwrap().end_unix;
+            let dt = a.m.frames[0].end_unix - first;
+            let center = (a.m.frames[a.selected].start_unix + a.m.frames[a.selected].end_unix) / 2.;
+            let width = if factor == 0. {
+                last - first
+            } else {
+                ((a.view_end - a.view_start) * factor).clamp(dt, last - first)
+            };
+            a.view_start = (center - width / 2.).clamp(first, last - width);
+            a.view_end = a.view_start + width;
+            if let Err(e) = overview(&a) {
+                report(e);
+            }
+        })?;
+    }
     let s = state.clone();
     on("time", "input", move |_| {
         pause(&s);
@@ -715,7 +862,12 @@ pub async fn start() -> Result<(), JsValue> {
             let s = s.clone();
             let i = {
                 let a = s.borrow();
-                (a.selected as isize + direction).clamp(0, a.m.frames.len() as isize - 1) as usize
+                let lo = a.m.frames.partition_point(|f| f.end_unix <= a.view_start);
+                let hi =
+                    a.m.frames
+                        .partition_point(|f| f.start_unix < a.view_end)
+                        .saturating_sub(1);
+                (a.selected as isize + direction).clamp(lo as isize, hi as isize) as usize
             };
             spawn_local(async move {
                 if let Err(e) = select(s, i).await {
@@ -797,7 +949,13 @@ pub async fn start() -> Result<(), JsValue> {
             if !a.playing || a.busy || now - last < 1000. / a.speed {
                 return;
             }
-            (a.selected + 1) % a.m.frames.len()
+            let lo = a.m.frames.partition_point(|f| f.end_unix <= a.view_start);
+            let hi = a.m.frames.partition_point(|f| f.start_unix < a.view_end);
+            if a.selected + 1 >= hi {
+                lo
+            } else {
+                a.selected + 1
+            }
         };
         last = now;
         let s = s.clone();

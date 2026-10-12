@@ -114,7 +114,7 @@ pub fn decoded_weight(k: usize) -> f64 {
     filter_weight(k) * m1 + second
 }
 
-pub fn process(data: &[C], normalization: f64) -> Result<Products> {
+pub fn process_ion(data: &[C], normalization: f64) -> Result<Products> {
     ensure!(
         data.len() == 196493,
         "unsupported BEATA layout: {} elements, expected 196493",
@@ -144,7 +144,7 @@ pub fn process(data: &[C], normalization: f64) -> Result<Products> {
         .iter()
         .map(|p| (*p as f64 / background[0] - 1.0) as f32)
         .collect();
-    let mut p = Products {
+    let p = Products {
         native_long: vec![],
         native_short: vec![],
         native_uncoded: vec![],
@@ -166,6 +166,11 @@ pub fn process(data: &[C], normalization: f64) -> Result<Products> {
         plasma_excess: vec![],
         background,
     };
+    Ok(p)
+}
+
+pub fn process(data: &[C], normalization: f64) -> Result<Products> {
+    let mut p = process_ion(data, normalization)?;
     for band in 0..BANDS {
         let offset = STRIDE * band;
         for (dest, start, len) in [
@@ -192,7 +197,7 @@ pub fn process(data: &[C], normalization: f64) -> Result<Products> {
             let power = data[108811 + offset + i].re / normalization;
             p.plasma_power.push(power as f32);
             p.plasma_excess
-                .push((power / background[band + 1] - 1.0) as f32);
+                .push((power / p.background[band + 1] - 1.0) as f32);
         }
     }
     p.decoded = native_spectra(&p.native_long, true)?;

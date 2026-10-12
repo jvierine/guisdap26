@@ -255,3 +255,16 @@ The reference's long-lag offset and 82,232-word channel stride agree with
 `native_long` extraction in the current Rust reader. This narrows further
 comparison to lag origin, weighting/FFT conventions and frequency/range metadata;
 it is not evidence for changing the current read address.
+
+
+## Full-study plasma averages
+
+The full-study pipeline retains all 800 native long lags and forms signed means
+at UTC-aligned 15 s and 60 s windows before display. Averaging the stored linear
+FFT output is equivalent to transforming the mean ACF; the Rust validation example
+checks this identity on representative intervals, all source assignments and all
+binary dimensions. No missing lags are filled. Partial intervals retain actual
+source counts and nominal UTC bounds. Independent-record standard errors combine
+in quadrature; averaging does not resolve the existing frequency/range-response
+validation limitations. Completion of this pipeline is not a claim that decoded
+plasma-line features have been independently validated.

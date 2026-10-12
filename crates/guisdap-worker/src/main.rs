@@ -1,5 +1,8 @@
 mod ion;
+mod ion_index;
 mod mat4;
+mod plasma_average;
+mod study;
 use anyhow::{ensure, Context, Result};
 use axum::response::IntoResponse;
 use chrono::{NaiveDate, TimeZone, Utc};
@@ -23,6 +26,26 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    RunStudy {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        monitor_only: bool,
+    },
+    AveragePlasma {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        integration_s: f64,
+        #[arg(long, default_value_t = 128)]
+        threads: usize,
+    },
+    IndexIon {
+        #[arg(long)]
+        config: PathBuf,
+    },
     FitIon {
         #[arg(long)]
         config: PathBuf,
@@ -51,7 +74,7 @@ enum Command {
         bind: String,
     },
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     roots: Vec<PathBuf>,
@@ -411,6 +434,15 @@ fn analyze(config: PathBuf, node: usize, nodes: usize) -> Result<()> {
                     data.cols == 1 && data.rows == 196493,
                     "unexpected correlator dimensions"
                 );
+                let dest = c.output.join("frames").join(format!("{}.h5", meta.id));
+                if dest.exists() {
+                    let old = read_meta(&hdf5::File::open(&dest)?)?;
+                    ensure!(
+                        old.schema == SCHEMA && old.source_sha256 == meta.source_sha256,
+                        "cached product mismatch"
+                    );
+                    return Ok(Some(meta));
+                }
                 let p = core::process(&data.complex(), par[21])?;
                 write_frame(&c.output.join("frames"), &meta, &p, par)?;
                 eprintln!(
@@ -447,6 +479,12 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
     tmp.as_file().sync_all()?;
     tmp.persist(path)?;
     Ok(())
@@ -457,6 +495,7 @@ fn binary(path: &Path, v: &[f32]) -> Result<()> {
 }
 #[derive(Serialize)]
 struct WebFrame {
+    source_count: usize,
     id: String,
     start_unix: f64,
     end_unix: f64,
@@ -484,6 +523,18 @@ fn export(input: &Path, output: &Path) -> Result<()> {
             "conflicting recordings at same UTC time"
         );
     }
+    let revision = format!(
+        "{:x}",
+        Sha256::digest(
+            frames
+                .iter()
+                .map(|(m, _)| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(";")
+        )
+    );
+    let overview_root = format!("overviews/{}/", &revision[..16]);
+    let overview = output.join(&overview_root);
     let n = frames.len();
     let mut broad = vec![0f32; 800 * n];
     let mut ion = vec![0f32; 432 * n];
@@ -516,9 +567,16 @@ fn export(input: &Path, output: &Path) -> Result<()> {
             ("plasma_excess", "plasma-power.f32"),
             ("decoded_lag0", "decoded-lag0.f32"),
         ] {
-            binary(&d.join(file), &f.dataset(name)?.read_raw::<f32>()?)?;
+            if !d.join(file).exists() {
+                binary(&d.join(file), &f.dataset(name)?.read_raw::<f32>()?)?;
+            }
         }
         index.push(WebFrame {
+            source_count: if f.link_exists("integration_source_count") {
+                f.dataset("integration_source_count")?.read_raw::<u32>()?[0] as usize
+            } else {
+                1
+            },
             id: m.id.clone(),
             start_unix: m.start_unix,
             end_unix: m.end_unix,
@@ -530,7 +588,7 @@ fn export(input: &Path, output: &Path) -> Result<()> {
     }
     // Temporal median subtraction per band/gate/frequency: diagnostic excess only.
     // Store raw broad spectra too so persistent features can be inspected.
-    binary(&output.join("broad-raw.f32"), &broad)?;
+    binary(&overview.join("broad-raw.f32"), &broad)?;
     for row in broad.chunks_mut(n) {
         let mut v = row.to_vec();
         v.sort_by(f32::total_cmp);
@@ -543,12 +601,12 @@ fn export(input: &Path, output: &Path) -> Result<()> {
             *x -= med;
         }
     }
-    binary(&output.join("broad-excess.f32"), &broad)?;
-    binary(&output.join("ion-power.f32"), &ion)?;
-    binary(&output.join("ion-short-raw-ne.f32"), &ion_ne)?;
-    binary(&output.join("ion-short-raw-ne-sigma.f32"), &ion_se)?;
+    binary(&overview.join("broad-excess.f32"), &broad)?;
+    binary(&overview.join("ion-power.f32"), &ion)?;
+    binary(&overview.join("ion-short-raw-ne.f32"), &ion_ne)?;
+    binary(&overview.join("ion-short-raw-ne-sigma.f32"), &ion_se)?;
     let first = &frames[0].0;
-    let manifest = serde_json::json!({"schema":SCHEMA,"title":"BEATA · 2 November 2022","frames":index,
+    let manifest = serde_json::json!({"schema":SCHEMA,"title":"BEATA · 2 November 2022","frames":index,"overview_root":overview_root,
         "native_uncoded_shape":[2,50,4,2],"native_long_shape":[2,800,90,2],"native_short_shape":[2,50,91,2],"decoded_shape":[2,90,core::NFFT],"broad_shape":[2,4,100,n],"ion_shape":[431,n],"ion_zero_lag_shape":[432,n],
         "ion_profile":{"signal_offset":480,"gates":431,"lag_s":10e-6,"slice_offset":25531,"slices":14,"background_subtracted":false,"calibration_offset":16,"response_width_slant_km":2.1724186,"scale":"signed 10 us lag raw-Ne equivalent; peak spectral response, Te/Ti=1, no Debye correction","magic_constant":0.7,"antenna_efficiency":0.66,"uncertainty":"approximate 1-sigma scatter of fourteen subintegrations plus calibration-sample propagation; online clutter can correlate slices; excludes that covariance, decorrelation/Doppler and systematic calibration errors"},
         "lag_block_roles":{"native_long":"decoded altitude spectrum, lags 1..800", "native_short":"decoded short-lag diagnostic, distinct range response", "native_uncoded":"four overlapping broad gates; diagnostic/calibration only; excluded from altitude spectrum"},
@@ -564,10 +622,21 @@ fn export(input: &Path, output: &Path) -> Result<()> {
     println!("Exported {n} frames to {}", output.display());
     Ok(())
 }
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     match Args::parse().command {
+        Command::RunStudy {
+            config,
+            monitor_only,
+        } => study::run(&config, monitor_only),
+        Command::AveragePlasma {
+            input,
+            output,
+            integration_s,
+            threads,
+        } => plasma_average::run(&input, &output, integration_s, threads),
         Command::FitIon { config } => ion::run(&config),
+        Command::IndexIon { config } => ion_index::run(&config),
         Command::Analyze {
             config,
             node_index,

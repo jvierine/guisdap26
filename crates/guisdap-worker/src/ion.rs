@@ -1,5 +1,6 @@
 //! BEATA ion fitting orchestration. Legacy numerical responses are read as data,
 //! never executed. Each observation owns its calibration and each job its state.
+mod stream;
 use super::{load, metadata};
 use anyhow::{ensure, Context, Result};
 use guisdap_core::{altitude_km, FrameMeta};
@@ -33,6 +34,10 @@ pub struct Config {
     pub antenna_efficiency: f64,
     pub calibration_multiplier: f64,
     pub threads: usize,
+    #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
+    pub live_export: Option<PathBuf>,
 }
 #[derive(Clone)]
 struct Group {
@@ -86,6 +91,14 @@ pub struct Profile {
     pub source_count: usize,
     pub sources: Vec<FrameMeta>,
     pub gates: Vec<Gate>,
+    #[serde(default)]
+    pub processing_state: String,
+    #[serde(default)]
+    pub detail_url: Option<String>,
+    #[serde(default)]
+    pub raw_ne: Vec<Option<[f64; 2]>>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 #[derive(Serialize)]
 struct Output<'a> {
@@ -404,6 +417,9 @@ fn fit_gate(records: &[Record], exp: &Experiment, cfg: &Config, lo: f64, hi: f64
 }
 pub fn run(path: &Path) -> Result<()> {
     let cfg: Config = serde_json::from_slice(&fs::read(path)?)?;
+    if cfg.streaming {
+        return stream::run(&cfg);
+    }
     ensure!(
         cfg.integration_s >= 15.
             && cfg.integration_s.is_finite()
@@ -489,6 +505,10 @@ pub fn run(path: &Path) -> Result<()> {
             source_count: records.len(),
             sources: records.iter().map(|r| r.meta.clone()).collect(),
             gates,
+            processing_state: "complete".into(),
+            detail_url: None,
+            raw_ne: vec![],
+            notes: vec![],
         });
     }
     let output=Output{schema:"beata22-ionfit-v1",config:&cfg,experiment_sha256:&exp.hash,uncertainty:"Temporal cluster sandwich over five-second records with conditional variance floor; approximate, includes variability; no absolute-calibration or composition systematics",limitations:vec!["Local homogeneous Maxwellian model with fixed altitude-dependent O+/30.5 amu composition; composition is assumed, not measured", "Number-conserving BGK collision model at low altitude; not a full magnetized ion-neutral collision model", "Only decoded signal lags 10..410 us are fitted; broad zero lag is retained separately and requires a joint range model", "Lag slices repeat the first lag and are not counted as independent measurements", "Residual score uses diagonal weighting; correlated lags mean it is not a calibrated chi-square goodness-of-fit test", "Velocity sign refers to positive model spectral shift; physical LOS sign unverified", "Density retains the event's assumed radar calibration (efficiency and calibration multiplier in config)"],profiles:&profiles};

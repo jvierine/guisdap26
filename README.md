@@ -119,3 +119,34 @@ For ion fitting, run `target/release/guisdap-worker fit-ion --config config/ion-
 The fit inspector is `ion.html`; its static-product location is in `ion-config.json`.
 All new fitting and validation code is Rust. HDF5 preserves the full numerical
 results and provenance, and a static JSON export supplies the Rust/WASM viewer.
+
+
+## Full-study processing and live browsing
+
+Run both ion-line fitting and plasma-line processing on avaruus:
+
+```sh
+cargo build --release -p guisdap-worker
+target/release/guisdap-worker run-study --config config/study-avaruus.json
+```
+
+Edit `data_sources` (one or more mounted directories), `worker_threads`, UTC
+`start`/`end`, `work_root`, `publication_root`, and `integrations_s` in that config.
+The current study uses 128 compute threads and produces both 15 s and 60 s products.
+Stages share this capacity sequentially; parallel fit windows and gates use one
+Rayon pool. Restarting reuses validated input and interval caches.
+
+The full 2 November 2022 input contains 2,869 native records, approximately
+15:00:35–19:00 UTC: 958 nominal 15 s intervals and 240 one-minute intervals.
+Five 15 s intervals have only two records and are flagged insufficient for fitting.
+Partial plasma averages retain their actual source count. Processing completion
+is distinct from fit convergence or validation of plasma-line decoding.
+
+`ion.html` provides resolution switching, shared time zoom across five stacked
+parameter/raw-Ne rows, altitude limits, and on-demand fit diagnostics. Its
+Processing status tab shows both cadences and the plasma-line stages. Completed
+ion intervals publish atomically during fitting; the viewer polls for updates
+without resetting the selected time or zoom. Plasma products publish after each
+cadence completes, with immutable overview files. Existing products remain usable
+while analysis runs. Both viewers work on a static server with exported products;
+no compute service is required by the browser.
