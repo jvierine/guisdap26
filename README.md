@@ -21,8 +21,17 @@ units below. The plasma-line display has the temporal median removed.
 
 One-minute analysis: raw electron-density proxy from the 10 µs ion-line lag
 (top) and fitted electron density (bottom), on shared time and altitude axes.
+Rejected fits are set to NaN in the display; the raw measurements are retained.
 
 ![One-minute raw and fitted electron density](docs/images/ion-density-60s.png)
+
+High-SNR F-region ion-line ACF and spectra: 18:25–18:26 UTC, 277–297 km.
+The first-lag signal-to-noise ratio is 39; the weighted residual score is 0.98.
+This return persists across neighbouring minutes and altitude gates. Grey shows
+measurements; gold shows the fitted response. The lower panels compare the
+measured ACF matrix DFT with the analytical ISR spectrum.
+
+![F-region ion-line ACF and spectra](docs/images/ion-acf-spectrum.png)
 
 ## Documentation
 
