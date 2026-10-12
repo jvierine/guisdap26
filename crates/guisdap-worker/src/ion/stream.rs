@@ -143,6 +143,7 @@ fn publish(cfg: &Config, profiles: &[Value], phase: &str, started: i64) -> Resul
         "processing":{"phase":phase,"threads":cfg.threads,"total":profiles.len(),"completed":completed,"failed":failed,"insufficient":insufficient,"source_records":profiles.iter().map(|p|p["source_count"].as_u64().unwrap_or(0)).sum::<u64>(),"started_unix":started,"updated_unix":chrono::Utc::now().timestamp()},
         "profiles":profiles});
     let bytes = serde_json::to_vec(&document)?;
+    document["calibration"] = json!({"magic_constant":cfg.calibration_multiplier,"antenna_efficiency":cfg.antenna_efficiency});
     let status = serde_json::to_vec(&document["processing"])?;
     super::super::atomic_bytes(&cfg.export.join("status.json"), &status)?;
     if let Some(live) = &cfg.live_export {

@@ -200,3 +200,22 @@ mod gain_tests {
         assert!(fit_gain(&[(0., 1., 0)]).is_none());
     }
 }
+
+#[cfg(test)]
+mod absolute_gain_test {
+    use super::*;
+    #[test]
+    fn recovered_constant_is_independent_of_input_reference() {
+        for reference in [0.7, 1.0, 1.3] {
+            let measured = [1e11, 2e11, 3e11].map(|unit| reference * unit);
+            let samples: Vec<_> = measured
+                .iter()
+                .enumerate()
+                .map(|(i, &raw)| (raw / reference, 1.4 * (i + 1) as f64 * 1e11, i as u64))
+                .collect();
+            let fit = fit_gain(&samples).unwrap();
+            assert!((fit.gain - 1.4).abs() < 1e-12);
+            assert!(fit.standard_error.unwrap() < 1e-12);
+        }
+    }
+}

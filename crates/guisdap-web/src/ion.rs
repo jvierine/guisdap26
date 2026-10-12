@@ -10,12 +10,19 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 #[derive(Clone, Deserialize)]
 struct Data {
+    #[serde(default)]
+    calibration: Option<CalibrationMetadata>,
     schema: String,
     uncertainty: String,
     limitations: Vec<String>,
     profiles: Vec<Profile>,
     #[serde(default)]
     processing: Option<Processing>,
+}
+#[derive(Clone, Deserialize)]
+struct CalibrationMetadata {
+    magic_constant: f64,
+    antenna_efficiency: f64,
 }
 #[derive(Clone, Deserialize)]
 struct Profile {
@@ -558,6 +565,7 @@ fn acf(v: &Viewer, component: usize) -> String {
     s
 }
 fn render(v: &Viewer) {
+    text("fit-calibration-used",&v.data.calibration.as_ref().map(|c|format!("Magic constant used: {:.4} · antenna efficiency: {:.3} · these values produced the displayed fits; plasma-line calibration estimates are not automatically applied.",c.magic_constant,c.antenna_efficiency)).unwrap_or_else(||"Magic constant used: not recorded in this product.".into()));
     instruments::render(v);
     let p = selected(v);
     let g = &p.gates[v.gate];

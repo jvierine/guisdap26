@@ -70,6 +70,8 @@ struct Point {
     ion_product_url: String,
     radar_frequency_hz: f64,
     original_calibration_multiplier: f64,
+    #[serde(default)]
+    magic_constant: f64,
     te_k: f64,
     ti_k: f64,
     fitted_ne_m3: f64,
@@ -295,6 +297,7 @@ fn point(c: &Calibration) -> Result<Point, String> {
             .unwrap_or_else(|| s.ion_index_url.clone()),
         radar_frequency_hz: s.radar_frequency_hz,
         original_calibration_multiplier: s.calibration_multiplier,
+        magic_constant: s.calibration_multiplier * result.calibration_multiplier_ratio,
         te_k: f.plasma.electron_temperature_k,
         ti_k: f.plasma.ion_temperature_k,
         fitted_ne_m3: f.plasma.electron_density_m3,
@@ -325,8 +328,8 @@ fn preview(c: &Calibration) {
                 let _ = marker.set_attribute("stroke", "#a9fff3");
                 let _ = svg.append_child(&marker);
             }
-            text("cal-result",&format!("Altitude {:.1} km · one-minute fit {}–{} UTC · status {} · residual {:.2}\nTe {:.0} ± {} K; Ti {:.0} ± {} K; Te/Ti {:.3}\nCold Ne {:.4e}; thermal-corrected Ne {:.4e} m⁻³\nThermal frequency term {:.3} MHz²; Debye length {:.4} m; k²λD² {:.4}; power denominator {:.4}\nFitted Ne {:.4e} m⁻³; fitted-power denominator {:.4}\nCalibration multiplier ×{:.4}: {:.4} → {:.4}; radar-equation magic gain ×{:.4}\n{}",
-                p.altitude_km,utc(p.ion_start_unix),utc(p.ion_end_unix),p.fit_status,p.residual_score,p.te_k,p.fit_standard_error[2].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),p.ti_k,p.fit_standard_error[1].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),a.temperature_ratio,a.cold_density_m3,a.plasma_density_m3,a.thermal_frequency_squared_hz2/1e12,a.debye_length_m,a.k2_debye2,a.ion_power_denominator,p.fitted_ne_m3,a.fitted_ion_power_denominator,a.calibration_multiplier_ratio,p.original_calibration_multiplier,p.original_calibration_multiplier*a.calibration_multiplier_ratio,a.magic_gain_ratio,
+            text("cal-result",&format!("Altitude {:.1} km · one-minute fit {}–{} UTC · status {} · residual {:.2}\nTe {:.0} ± {} K; Ti {:.0} ± {} K; Te/Ti {:.3}\nCold Ne {:.4e}; thermal-corrected Ne {:.4e} m⁻³\nThermal frequency term {:.3} MHz²; Debye length {:.4} m; k²λD² {:.4}; power denominator {:.4}\nFitted Ne {:.4e} m⁻³; fitted-power denominator {:.4}\nEstimated magic constant {:.4} (dimensionless)\nInput product magic constant {:.4}; relative density correction ×{:.4}\n{}",
+                p.altitude_km,utc(p.ion_start_unix),utc(p.ion_end_unix),p.fit_status,p.residual_score,p.te_k,p.fit_standard_error[2].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),p.ti_k,p.fit_standard_error[1].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),a.temperature_ratio,a.cold_density_m3,a.plasma_density_m3,a.thermal_frequency_squared_hz2/1e12,a.debye_length_m,a.k2_debye2,a.ion_power_denominator,p.fitted_ne_m3,a.fitted_ion_power_denominator,p.magic_constant,p.original_calibration_multiplier,a.calibration_multiplier_ratio,
                 if p.included {"Eligible for inclusion. Confirm the altitude association before saving."} else {"Flagged fit or k²λD² ≥ 0.1: saved excluded by default. Thermal approximation / fit quality requires review."}));
             let current = el("cal-result").text_content().unwrap_or_default();
             text("cal-result",&format!("{current}\nMeasured raw 10 µs Ne proxy {:.4e}; equivalent zero-lag raw Ne {:.4e} m⁻³\nModel short-lag response {:.5}; {} samples · {:.0} s × {:.1} km requested window",p.raw_ne_proxy_m3,p.equivalent_zero_lag_raw_ne_m3,p.short_lag_response,p.raw_sample_count,p.power_time_window_s,p.power_altitude_width_km));
@@ -336,9 +339,9 @@ fn preview(c: &Calibration) {
 }
 fn table(state: &Cal) {
     let c = state.borrow();
-    let mut html=String::from("<table><thead><tr><th>Use</th><th>UTC</th><th>Gate</th><th>MHz</th><th>km</th><th>Te/Ti</th><th>Ne / m⁻³</th><th>Multiplier ratio</th><th>Fit</th><th></th></tr></thead><tbody>");
+    let mut html=String::from("<table><thead><tr><th>Use</th><th>UTC</th><th>Gate</th><th>MHz</th><th>km</th><th>Te/Ti</th><th>Ne / m⁻³</th><th>Magic constant</th><th>Fit</th><th></th></tr></thead><tbody>");
     for (i, p) in c.points.iter().enumerate() {
-        html.push_str(&format!("<tr><td><input id='cal-use-{i}' aria-label='Include calibration point {}' type='checkbox' {}></td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.1}</td><td>{:.2}</td><td>{:.3e}</td><td>{:.4}</td><td>{}</td><td><button id='cal-edit-{i}'>Edit altitude</button><button id='cal-remove-{i}'>Remove {}</button></td></tr>",i+1,if p.included {"checked"}else{""},utc(p.time_unix),p.broad_gate,p.frequency_hz/1e6,p.altitude_km,p.estimate.temperature_ratio,p.estimate.plasma_density_m3,p.estimate.calibration_multiplier_ratio,p.fit_status,i+1));
+        html.push_str(&format!("<tr><td><input id='cal-use-{i}' aria-label='Include calibration point {}' type='checkbox' {}></td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.1}</td><td>{:.2}</td><td>{:.3e}</td><td>{:.4}</td><td>{}</td><td><button id='cal-edit-{i}'>Edit altitude</button><button id='cal-remove-{i}'>Remove {}</button></td></tr>",i+1,if p.included {"checked"}else{""},utc(p.time_unix),p.broad_gate,p.frequency_hz/1e6,p.altitude_km,p.estimate.temperature_ratio,p.estimate.plasma_density_m3,p.magic_constant,p.fit_status,i+1));
     }
     html.push_str("</tbody></table>");
     el("cal-points").set_inner_html(&html);
@@ -346,7 +349,7 @@ fn table(state: &Cal) {
         .points
         .iter()
         .filter(|p| p.included)
-        .map(|p| p.estimate.calibration_multiplier_ratio)
+        .map(|p| p.magic_constant)
         .collect();
     values.sort_by(f64::total_cmp);
     text(
@@ -356,16 +359,16 @@ fn table(state: &Cal) {
         } else {
             let n = values.len();
             let median = (values[(n - 1) / 2] + values[n / 2]) / 2.;
-            format!("{} included points · median multiplier ratio {:.4} · range {:.4}–{:.4}. Repeat clicks are not independent measurements. No processing settings have been changed.",n,median,values[0],values[n-1])
+            format!("{} included points · median magic constant {:.4} · range {:.4}–{:.4}. Repeat clicks are not independent measurements. No processing settings have been changed.",n,median,values[0],values[n-1])
         },
     );
-    let export = serde_json::json!({"schema":"guisdap26-plasma-calibration-v1","method":"Unmagnetized Bohm-Gross; finite-Debye ion power Ne/[(1+q)(1+q+Te/Ti)]. Measured 10-us raw Ne converted with the experiment spectral response and fitted shape at plasma-line density; finite-Debye equivalent power. No raw short-lag zero-lag substitution; no drift correction. Approximation, not a kinetic dispersion inversion.","points":c.points,"gain_fit":guisdap_core::calibration::fit_gain(&c.points.iter().filter(|p|p.included).map(|p|(p.raw_ne_proxy_m3,p.raw_ne_proxy_m3*p.estimate.calibration_multiplier_ratio,p.ion_start_unix.to_bits())).collect::<Vec<_>>())});
+    let export = serde_json::json!({"schema":"guisdap26-plasma-calibration-v1","method":"Unmagnetized Bohm-Gross; finite-Debye ion power Ne/[(1+q)(1+q+Te/Ti)]. Measured 10-us raw Ne converted with the experiment spectral response and fitted shape at plasma-line density; finite-Debye equivalent power. No raw short-lag zero-lag substitution; no drift correction. Approximation, not a kinetic dispersion inversion.","points":c.points,"magic_constant_fit":guisdap_core::calibration::fit_gain(&c.points.iter().filter(|p|p.included).map(|p|(p.raw_ne_proxy_m3/p.original_calibration_multiplier,p.raw_ne_proxy_m3*p.estimate.calibration_multiplier_ratio,p.ion_start_unix.to_bits())).collect::<Vec<_>>())});
     let uri = js_sys::encode_uri_component(&serde_json::to_string_pretty(&export).unwrap());
     let _ = el("cal-export").set_attribute(
         "href",
         &format!("data:application/json;charset=utf-8,{uri}"),
     );
-    let mut graph=String::from("<svg viewBox='0 0 650 310' style='width:100%;max-width:700px;font:12px system-ui;fill:#c8d5e0' role='img' aria-label='Accumulated calibration multiplier versus altitude'><text x='60' y='20'>Calibration multiplier ratio versus altitude</text>");
+    let mut graph=String::from("<svg viewBox='0 0 650 310' style='width:100%;max-width:700px;font:12px system-ui;fill:#c8d5e0' role='img' aria-label='Absolute magic constant versus altitude'><text x='60' y='20'>Magic constant versus altitude</text>");
     for h in [50, 150, 250, 350, 450] {
         let y = 270. - (h as f64 - 40.) / 440. * 230.;
         graph.push_str(&format!("<text x='50' y='{y}' text-anchor='end'>{h}</text><path d='M60,{y} H610' stroke='#344652'/>"));
@@ -373,14 +376,14 @@ fn table(state: &Cal) {
     let lower = c
         .points
         .iter()
-        .map(|p| p.estimate.calibration_multiplier_ratio.log10())
+        .map(|p| p.magic_constant.log10())
         .fold(0., f64::min)
         .floor()
         - 0.2;
     let upper = c
         .points
         .iter()
-        .map(|p| p.estimate.calibration_multiplier_ratio.log10())
+        .map(|p| p.magic_constant.log10())
         .fold(0., f64::max)
         .ceil()
         + 0.2;
@@ -393,8 +396,7 @@ fn table(state: &Cal) {
         ));
     }
     for (i, p) in c.points.iter().enumerate() {
-        let x = 60.
-            + 550. * (p.estimate.calibration_multiplier_ratio.log10() - lower) / (upper - lower);
+        let x = 60. + 550. * (p.magic_constant.log10() - lower) / (upper - lower);
         let y = 270. - (p.altitude_km - 40.) / 440. * 230.;
         graph.push_str(&format!(
             "<circle cx='{x}' cy='{y}' r='5' fill='{}'/><text x='{}' y='{y}'>{}</text>",
@@ -411,7 +413,7 @@ fn table(state: &Cal) {
         .iter()
         .flat_map(|p| {
             [
-                p.raw_ne_proxy_m3,
+                p.raw_ne_proxy_m3 / p.original_calibration_multiplier,
                 p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio,
             ]
         })
@@ -424,7 +426,7 @@ fn table(state: &Cal) {
         .iter()
         .flat_map(|p| {
             [
-                p.raw_ne_proxy_m3,
+                p.raw_ne_proxy_m3 / p.original_calibration_multiplier,
                 p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio,
             ]
         })
@@ -440,14 +442,14 @@ fn table(state: &Cal) {
         let py = y(z);
         scatter.push_str(&format!("<text x='{px}' y='292' text-anchor='middle'>{:.1e}</text><text x='55' y='{py}' text-anchor='end'>{:.1e}</text>",10_f64.powf(z),10_f64.powf(z)));
     }
-    scatter.push_str("<path d='M60,270 L610,40' stroke='#617889' stroke-dasharray='4 4'/><text x='325' y='320' text-anchor='middle'>Measured raw Ne / m⁻³ · log axes · dashed line: ratio 1</text>");
+    scatter.push_str("<path d='M60,270 L610,40' stroke='#617889' stroke-dasharray='4 4'/><text x='325' y='320' text-anchor='middle'>Measured raw Ne at C=1 / m⁻³ · dashed: C=1</text>");
     let samples: Vec<_> = c
         .points
         .iter()
         .filter(|p| p.included)
         .map(|p| {
             (
-                p.raw_ne_proxy_m3,
+                p.raw_ne_proxy_m3 / p.original_calibration_multiplier,
                 p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio,
                 p.ion_start_unix.to_bits(),
             )
@@ -482,7 +484,7 @@ fn table(state: &Cal) {
     }
     scatter.push_str("</g>");
     for (i, p) in c.points.iter().enumerate() {
-        let px = x(p.raw_ne_proxy_m3.log10());
+        let px = x((p.raw_ne_proxy_m3 / p.original_calibration_multiplier).log10());
         let py = y((p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio).log10());
         scatter.push_str(&format!(
             "<circle cx='{px}' cy='{py}' r='5' fill='{}'/><text x='{}' y='{py}'>{}</text>",
@@ -494,8 +496,8 @@ fn table(state: &Cal) {
     scatter.push_str("</svg>");
     el("cal-power-scatter").set_inner_html(&scatter);
     text("cal-fit-summary",&match gain_fit {
-        Some(f)=>format!("Predicted = ({:.4}{}) × measured · {} included points, {} one-minute time groups. Band: ±1σ uncertainty of the fitted line (30% opacity); conditional on measured raw Ne and the plasma model. This is not a prediction interval and excludes systematic errors.",f.gain,f.standard_error.map(|se|format!(" ± {se:.4}")).unwrap_or_else(||"; uncertainty unavailable—include points from at least two one-minute fits".into()),f.points,f.time_clusters),
-        None=>"Include calibration points to fit predicted = gain × measured.".into(),
+        Some(f)=>format!("Estimated magic constant C = {:.4}{} (dimensionless); predicted = C × measured at C=1 · {} included points, {} one-minute time groups. Band: ±1σ uncertainty of the fitted line (30% opacity); conditional on measured raw Ne and the plasma model. This is not a prediction interval and excludes systematic errors.",f.gain,f.standard_error.map(|se|format!(" ± {se:.4}")).unwrap_or_else(||"; uncertainty unavailable—include points from at least two one-minute fits".into()),f.points,f.time_clusters),
+        None=>"Include calibration points to estimate the absolute magic constant.".into(),
     });
     markers(&c.app.borrow(), &c);
     let n = c.points.len();
@@ -624,7 +626,7 @@ fn candidates(c: &Calibration, bounds: [f64; 2]) {
     el("cal-altitude").set_inner_html(&options);
 }
 pub(super) fn start(app: State) -> Result<(), JsValue> {
-    let points = web_sys::window()
+    let mut points: Vec<Point> = web_sys::window()
         .unwrap()
         .local_storage()
         .ok()
@@ -632,6 +634,10 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
         .and_then(|s| s.get_item(KEY).ok().flatten())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    for p in &mut points {
+        p.magic_constant =
+            p.original_calibration_multiplier * p.estimate.calibration_multiplier_ratio;
+    }
     let storage = web_sys::window()
         .unwrap()
         .local_storage()?
@@ -679,6 +685,10 @@ pub(super) fn start(app: State) -> Result<(), JsValue> {
                 let mut c = loaded.borrow_mut();
                 if n.revision > 0 {
                     c.points = n.points;
+                    for p in &mut c.points {
+                        p.magic_constant = p.original_calibration_multiplier
+                            * p.estimate.calibration_multiplier_ratio;
+                    }
                 }
                 let mut sync = c.sync.borrow_mut();
                 sync.revision = n.revision;

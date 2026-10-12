@@ -312,3 +312,13 @@ band. This conditions on measured x and the plasma model; it is not an
 errors-in-variables fit, full propagated physical uncertainty, or a prediction
 interval. Repeated points within a time group do not count as independent
 uncertainty samples. The line and error are also included in JSON export.
+
+The primary calibration result is now the absolute GUISDAP-convention magic
+constant C, not a correction ratio. Each measured raw-Ne x is divided by its
+recorded input C before fitting predicted = C × x(C=1). Both the fitted slope
+and its uncertainty therefore directly describe C, even if input references
+differ between points. Per-point absolute constants are migrated from saved
+reference × correction values. JSON export calls the fit `magic_constant_fit`;
+its `gain` field is C. Existing relative quantities remain provenance fields.
+Ion datasets expose the constant actually used and antenna efficiency in
+`calibration` metadata, separately from estimates that have not been applied.
