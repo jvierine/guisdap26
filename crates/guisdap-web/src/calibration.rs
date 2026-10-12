@@ -1,0 +1,1264 @@
+//! Explicit user-selected plasma-line calibration; no automatic rescaling.
+use super::*;
+use guisdap_core::calibration::{estimate, frequency_hz, Estimate};
+use serde::Serialize;
+#[derive(Deserialize, Clone)]
+struct Settings {
+    ion_index_url: String,
+    radar_frequency_hz: f64,
+    calibration_multiplier: f64,
+}
+#[derive(Deserialize)]
+struct Response {
+    frequency_hz: Vec<f64>,
+    kernel_real: Vec<Vec<f64>>,
+}
+#[derive(Deserialize)]
+struct Fits {
+    profiles: Vec<Profile>,
+}
+#[derive(Deserialize, Clone)]
+struct Profile {
+    start_unix: f64,
+    end_unix: f64,
+    gates: Vec<Gate>,
+    detail_url: Option<String>,
+}
+#[derive(Deserialize, Clone)]
+struct Gate {
+    oxygen_fraction: f64,
+    altitude_km: f64,
+    lower_km: f64,
+    upper_km: f64,
+    status: String,
+    result: Option<Fit>,
+}
+#[derive(Deserialize, Clone)]
+struct Fit {
+    plasma: Plasma,
+    standard_error: [Option<f64>; 5],
+    reduced_chi_square: f64,
+}
+#[derive(Deserialize, Clone)]
+struct Plasma {
+    velocity_m_s: f64,
+    ion_collision_s: f64,
+    electron_density_m3: f64,
+    electron_temperature_k: f64,
+    ion_temperature_k: f64,
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct Point {
+    #[serde(default)]
+    raw_product_url: String,
+    raw_ne_proxy_m3: f64,
+    equivalent_zero_lag_raw_ne_m3: f64,
+    short_lag_response: f64,
+    power_time_window_s: f64,
+    power_altitude_width_km: f64,
+    raw_sample_count: usize,
+    time_unix: f64,
+    plasma_start_unix: f64,
+    plasma_end_unix: f64,
+    broad_gate: usize,
+    frequency_hz: f64,
+    frequency_bin_width_hz: f64,
+    altitude_km: f64,
+    altitude_bounds_km: [f64; 2],
+    ion_start_unix: f64,
+    ion_end_unix: f64,
+    ion_product_url: String,
+    radar_frequency_hz: f64,
+    original_calibration_multiplier: f64,
+    te_k: f64,
+    ti_k: f64,
+    fitted_ne_m3: f64,
+    fit_standard_error: [Option<f64>; 5],
+    fit_status: String,
+    residual_score: f64,
+    estimate: Estimate,
+    included: bool,
+}
+#[derive(Clone)]
+struct Pending {
+    time: f64,
+    start: f64,
+    end: f64,
+    broad: usize,
+    frequency: f64,
+    profile: Profile,
+}
+pub(super) struct Calibration {
+    suppress_click: bool,
+    app: State,
+    response: Option<Response>,
+    editing: Option<usize>,
+    settings: Option<Settings>,
+    fits: Option<Fits>,
+    pending: Option<Pending>,
+    points: Vec<Point>,
+    request: u64,
+}
+pub(super) type Cal = Rc<RefCell<Calibration>>;
+const KEY: &str = "guisdap26-beata-calibration-v1";
+fn input(id: &str) -> HtmlInputElement {
+    el(id).dyn_into().unwrap()
+}
+fn save(c: &Calibration) {
+    if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
+        if let Ok(s) = serde_json::to_string(&c.points) {
+            let _ = storage.set_item(KEY, &s);
+        }
+    }
+}
+fn safe_fit(g: &Gate) -> bool {
+    let Some(f) = &g.result else {
+        return false;
+    };
+    g.status == "converged"
+        && [0, 1, 2]
+            .iter()
+            .all(|&i| f.standard_error[i].is_some_and(|x| x.is_finite() && x >= 0.))
+        && f.standard_error[0].unwrap() <= 0.5 * f.plasma.electron_density_m3
+        && f.standard_error[1].unwrap() <= f.plasma.ion_temperature_k
+        && f.standard_error[2].unwrap() <= f.plasma.electron_temperature_k
+}
+fn point(c: &Calibration) -> Result<Point, String> {
+    let s = c
+        .settings
+        .as_ref()
+        .ok_or("Calibration settings unavailable")?;
+    let p = c
+        .pending
+        .as_ref()
+        .ok_or("Click a broad-gate spectrum first")?;
+    let i = el("cal-altitude")
+        .dyn_into::<HtmlSelectElement>()
+        .unwrap()
+        .value()
+        .parse::<usize>()
+        .map_err(|_| "Select the source altitude")?;
+    let g = p.profile.gates.get(i).ok_or("Altitude unavailable")?;
+    let f = g.result.as_ref().ok_or("No fit at that altitude")?;
+    let height = input("cal-height")
+        .value()
+        .parse::<f64>()
+        .map_err(|_| "Invalid altitude")?;
+    let freq = input("cal-frequency")
+        .value()
+        .parse::<f64>()
+        .map_err(|_| "Invalid frequency")?
+        * 1e6;
+    // Frequency sign is retained, but the unmagnetized dispersion uses its square.
+    if !(-6.15e6..=-1.275e6).contains(&freq) {
+        return Err("Frequency is outside this event's recorded plasma bands".into());
+    }
+    let mut result = estimate(
+        freq,
+        s.radar_frequency_hz,
+        f.plasma.electron_temperature_k,
+        f.plasma.ion_temperature_k,
+        f.plasma.electron_density_m3,
+    )
+    .map_err(|e| e.to_string())?;
+    let response = c
+        .response
+        .as_ref()
+        .ok_or("Short-lag response unavailable")?;
+    let time_width = input("cal-time-width")
+        .value()
+        .parse::<f64>()
+        .map_err(|_| "Invalid time width")?;
+    let range_width = input("cal-range-width")
+        .value()
+        .parse::<f64>()
+        .map_err(|_| "Invalid altitude width")?;
+    if !time_width.is_finite() || time_width <= 0. || !range_width.is_finite() || range_width <= 0.
+    {
+        return Err("Positive averaging widths required".into());
+    }
+    let model = guisdap_ion::spectrum::SpectrumModel {
+        radar_frequency_hz: s.radar_frequency_hz,
+        electron_collision_s: 0.,
+        ions: vec![
+            guisdap_ion::spectrum::IonSpecies {
+                mass_amu: 16.,
+                fraction: g.oxygen_fraction,
+            },
+            guisdap_ion::spectrum::IonSpecies {
+                mass_amu: 30.5,
+                fraction: 1. - g.oxygen_fraction,
+            },
+        ],
+    };
+    let spectrum = model
+        .evaluate(
+            guisdap_ion::spectrum::PlasmaState {
+                electron_density_m3: result.plasma_density_m3,
+                electron_temperature_k: p.profile.gates[i]
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .plasma
+                    .electron_temperature_k,
+                ion_temperature_k: f.plasma.ion_temperature_k,
+                velocity_m_s: f.plasma.velocity_m_s,
+                ion_collision_s: f.plasma.ion_collision_s,
+            },
+            &response.frequency_hz,
+        )
+        .map_err(|e| e.to_string())?;
+    let app = c.app.borrow();
+    let n = app.m.frames.len();
+    let cadence = app.m.frames[0].end_unix - app.m.frames[0].start_unix;
+    if time_width + 0.01 < cadence {
+        return Err(format!(
+            "Choose at least {cadence:.0} s or switch the plasma viewer to a finer resolution"
+        ));
+    }
+    let mut sum = 0.;
+    let mut weight = 0.;
+    let mut expected = 0.;
+    let mut count = 0;
+    for (t, frame) in app.m.frames.iter().enumerate() {
+        let midpoint = (frame.start_unix + frame.end_unix) / 2.;
+        if midpoint < p.time - time_width / 2. || midpoint >= p.time + time_width / 2. {
+            continue;
+        }
+        for (j, r) in app.m.ion_range_km.iter().enumerate() {
+            let target_height = height;
+            let height = altitude(*r, frame.elevation_deg);
+            if (height - target_height).abs() > range_width / 2. {
+                continue;
+            }
+            let raw = app.power[j * n + t] as f64;
+            if !raw.is_finite() {
+                continue;
+            }
+            let w = frame.end_unix - frame.start_unix;
+            let kernel = response
+                .kernel_real
+                .get(j)
+                .ok_or("Missing native response")?;
+            let response_value = kernel
+                .iter()
+                .zip(&spectrum)
+                .map(|(k, v)| k * v)
+                .sum::<f64>();
+            sum += w * raw;
+            expected += w * response_value;
+            weight += w;
+            count += 1;
+        }
+    }
+    if count == 0 || sum <= 0. {
+        return Err("No positive measured short-lag power in the selected window".into());
+    }
+    let raw = sum / weight;
+    let response_value = expected / weight;
+    if response_value <= 0. || !response_value.is_finite() {
+        return Err(
+            "Short-lag model response is nonpositive; conversion is ill-conditioned".into(),
+        );
+    }
+    let zero = guisdap_core::calibration::short_lag_conversion(&mut result, raw, response_value)
+        .map_err(|e| e.to_string())?;
+    Ok(Point {
+        raw_product_url: format!("{}{}ion-short-raw-ne.f32", app.root, app.m.overview_root),
+        raw_ne_proxy_m3: raw,
+        equivalent_zero_lag_raw_ne_m3: zero,
+        short_lag_response: response_value,
+        power_time_window_s: time_width,
+        power_altitude_width_km: range_width,
+        raw_sample_count: count,
+        time_unix: p.time,
+        plasma_start_unix: p.start,
+        plasma_end_unix: p.end,
+        broad_gate: p.broad + 1,
+        frequency_hz: freq,
+        frequency_bin_width_hz: 25000.,
+        altitude_km: height,
+        altitude_bounds_km: [g.lower_km, g.upper_km],
+        ion_start_unix: p.profile.start_unix,
+        ion_end_unix: p.profile.end_unix,
+        ion_product_url: p
+            .profile
+            .detail_url
+            .clone()
+            .map(|d| format!("{}{d}", s.ion_index_url.trim_end_matches("index.json")))
+            .unwrap_or_else(|| s.ion_index_url.clone()),
+        radar_frequency_hz: s.radar_frequency_hz,
+        original_calibration_multiplier: s.calibration_multiplier,
+        te_k: f.plasma.electron_temperature_k,
+        ti_k: f.plasma.ion_temperature_k,
+        fitted_ne_m3: f.plasma.electron_density_m3,
+        fit_standard_error: f.standard_error,
+        fit_status: g.status.clone(),
+        residual_score: f.reduced_chi_square,
+        included: safe_fit(g) && result.k2_debye2 < 0.1,
+        estimate: result,
+    })
+}
+fn preview(c: &Calibration) {
+    match point(c) {
+        Err(e) => text("cal-result", &e),
+        Ok(p) => {
+            let a = &p.estimate;
+            if let Ok(Some(svg)) = el("cal-candidates").query_selector("svg") {
+                if let Ok(Some(old)) = svg.query_selector("#cal-height-marker") {
+                    old.remove();
+                }
+                let low = input("cal-height").min().parse::<f64>().unwrap_or(0.);
+                let high = input("cal-height").max().parse::<f64>().unwrap_or(500.);
+                let y = 255. - 210. * (p.altitude_km - low) / (high - low);
+                let marker = doc()
+                    .create_element_ns(Some("http://www.w3.org/2000/svg"), "path")
+                    .unwrap();
+                let _ = marker.set_attribute("id", "cal-height-marker");
+                let _ = marker.set_attribute("d", &format!("M60,{y} H610"));
+                let _ = marker.set_attribute("stroke", "#a9fff3");
+                let _ = svg.append_child(&marker);
+            }
+            text("cal-result",&format!("Altitude {:.1} km · one-minute fit {}–{} UTC · status {} · residual {:.2}\nTe {:.0} ± {} K; Ti {:.0} ± {} K; Te/Ti {:.3}\nCold Ne {:.4e}; thermal-corrected Ne {:.4e} m⁻³\nThermal frequency term {:.3} MHz²; Debye length {:.4} m; k²λD² {:.4}; power denominator {:.4}\nFitted Ne {:.4e} m⁻³; fitted-power denominator {:.4}\nCalibration multiplier ×{:.4}: {:.4} → {:.4}; radar-equation magic gain ×{:.4}\n{}",
+                p.altitude_km,utc(p.ion_start_unix),utc(p.ion_end_unix),p.fit_status,p.residual_score,p.te_k,p.fit_standard_error[2].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),p.ti_k,p.fit_standard_error[1].map(|x|format!("{x:.0}")).unwrap_or("unknown".into()),a.temperature_ratio,a.cold_density_m3,a.plasma_density_m3,a.thermal_frequency_squared_hz2/1e12,a.debye_length_m,a.k2_debye2,a.ion_power_denominator,p.fitted_ne_m3,a.fitted_ion_power_denominator,a.calibration_multiplier_ratio,p.original_calibration_multiplier,p.original_calibration_multiplier*a.calibration_multiplier_ratio,a.magic_gain_ratio,
+                if p.included {"Eligible for inclusion. Confirm the altitude association before saving."} else {"Flagged fit or k²λD² ≥ 0.1: saved excluded by default. Thermal approximation / fit quality requires review."}));
+            let current = el("cal-result").text_content().unwrap_or_default();
+            text("cal-result",&format!("{current}\nMeasured raw 10 µs Ne proxy {:.4e}; equivalent zero-lag raw Ne {:.4e} m⁻³\nModel short-lag response {:.5}; {} samples · {:.0} s × {:.1} km requested window",p.raw_ne_proxy_m3,p.equivalent_zero_lag_raw_ne_m3,p.short_lag_response,p.raw_sample_count,p.power_time_window_s,p.power_altitude_width_km));
+        }
+    }
+    markers(&c.app.borrow(), c);
+}
+fn table(state: &Cal) {
+    let c = state.borrow();
+    let mut html=String::from("<table><thead><tr><th>Use</th><th>UTC</th><th>Gate</th><th>MHz</th><th>km</th><th>Te/Ti</th><th>Ne / m⁻³</th><th>Multiplier ratio</th><th>Fit</th><th></th></tr></thead><tbody>");
+    for (i, p) in c.points.iter().enumerate() {
+        html.push_str(&format!("<tr><td><input id='cal-use-{i}' aria-label='Include calibration point {}' type='checkbox' {}></td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.1}</td><td>{:.2}</td><td>{:.3e}</td><td>{:.4}</td><td>{}</td><td><button id='cal-edit-{i}'>Edit altitude</button><button id='cal-remove-{i}'>Remove {}</button></td></tr>",i+1,if p.included {"checked"}else{""},utc(p.time_unix),p.broad_gate,p.frequency_hz/1e6,p.altitude_km,p.estimate.temperature_ratio,p.estimate.plasma_density_m3,p.estimate.calibration_multiplier_ratio,p.fit_status,i+1));
+    }
+    html.push_str("</tbody></table>");
+    el("cal-points").set_inner_html(&html);
+    let mut values: Vec<_> = c
+        .points
+        .iter()
+        .filter(|p| p.included)
+        .map(|p| p.estimate.calibration_multiplier_ratio)
+        .collect();
+    values.sort_by(f64::total_cmp);
+    text(
+        "cal-summary",
+        &if values.is_empty() {
+            "No included calibration points.".into()
+        } else {
+            let n = values.len();
+            let median = (values[(n - 1) / 2] + values[n / 2]) / 2.;
+            format!("{} included points · median multiplier ratio {:.4} · range {:.4}–{:.4}. Repeat clicks are not independent measurements. No processing settings have been changed.",n,median,values[0],values[n-1])
+        },
+    );
+    let export = serde_json::json!({"schema":"guisdap26-plasma-calibration-v1","method":"Unmagnetized Bohm-Gross; finite-Debye ion power Ne/[(1+q)(1+q+Te/Ti)]. Measured 10-us raw Ne converted with the experiment spectral response and fitted shape at plasma-line density; finite-Debye equivalent power. No raw short-lag zero-lag substitution; no drift correction. Approximation, not a kinetic dispersion inversion.","points":c.points});
+    let uri = js_sys::encode_uri_component(&serde_json::to_string_pretty(&export).unwrap());
+    let _ = el("cal-export").set_attribute(
+        "href",
+        &format!("data:application/json;charset=utf-8,{uri}"),
+    );
+    let mut graph=String::from("<svg viewBox='0 0 650 310' style='width:100%;max-width:700px;font:12px system-ui;fill:#c8d5e0' role='img' aria-label='Accumulated calibration multiplier versus altitude'><text x='60' y='20'>Calibration multiplier ratio versus altitude</text>");
+    for h in [50, 150, 250, 350, 450] {
+        let y = 270. - (h as f64 - 40.) / 440. * 230.;
+        graph.push_str(&format!("<text x='50' y='{y}' text-anchor='end'>{h}</text><path d='M60,{y} H610' stroke='#344652'/>"));
+    }
+    let lower = c
+        .points
+        .iter()
+        .map(|p| p.estimate.calibration_multiplier_ratio.log10())
+        .fold(0., f64::min)
+        .floor()
+        - 0.2;
+    let upper = c
+        .points
+        .iter()
+        .map(|p| p.estimate.calibration_multiplier_ratio.log10())
+        .fold(0., f64::max)
+        .ceil()
+        + 0.2;
+    for i in 0..=4 {
+        let z = lower + (upper - lower) * i as f64 / 4.;
+        let px = 60. + 550. * i as f64 / 4.;
+        graph.push_str(&format!(
+            "<text x='{px}' y='295' text-anchor='middle'>{:.2}</text>",
+            10_f64.powf(z)
+        ));
+    }
+    for (i, p) in c.points.iter().enumerate() {
+        let x = 60.
+            + 550. * (p.estimate.calibration_multiplier_ratio.log10() - lower) / (upper - lower);
+        let y = 270. - (p.altitude_km - 40.) / 440. * 230.;
+        graph.push_str(&format!(
+            "<circle cx='{x}' cy='{y}' r='5' fill='{}'/><text x='{}' y='{y}'>{}</text>",
+            if p.included { "#efbc50" } else { "#aa647c" },
+            x + 8.,
+            i + 1
+        ));
+    }
+    graph.push_str("</svg>");
+    el("cal-accumulated").set_inner_html(&graph);
+    let mut scatter=String::from("<svg viewBox='0 0 650 330' style='width:100%;max-width:700px;font:12px system-ui;fill:#c8d5e0' role='img' aria-label='Calibration predicted versus measured short-lag power'><text x='60' y='20'>Predicted versus measured 10 µs raw Ne</text>");
+    let lo = c
+        .points
+        .iter()
+        .flat_map(|p| {
+            [
+                p.raw_ne_proxy_m3,
+                p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio,
+            ]
+        })
+        .map(f64::log10)
+        .fold(11., f64::min)
+        .floor()
+        - 0.1;
+    let hi = c
+        .points
+        .iter()
+        .flat_map(|p| {
+            [
+                p.raw_ne_proxy_m3,
+                p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio,
+            ]
+        })
+        .map(f64::log10)
+        .fold(11., f64::max)
+        .ceil()
+        + 0.1;
+    let x = |z: f64| 60. + 550. * (z - lo) / (hi - lo);
+    let y = |z: f64| 270. - 230. * (z - lo) / (hi - lo);
+    for i in 0..=4 {
+        let z = lo + (hi - lo) * i as f64 / 4.;
+        let px = x(z);
+        let py = y(z);
+        scatter.push_str(&format!("<text x='{px}' y='292' text-anchor='middle'>{:.1e}</text><text x='55' y='{py}' text-anchor='end'>{:.1e}</text>",10_f64.powf(z),10_f64.powf(z)));
+    }
+    scatter.push_str("<path d='M60,270 L610,40' stroke='#617889' stroke-dasharray='4 4'/><text x='325' y='320' text-anchor='middle'>Measured raw Ne / m⁻³ · log axes · dashed line: ratio 1</text>");
+    for (i, p) in c.points.iter().enumerate() {
+        let px = x(p.raw_ne_proxy_m3.log10());
+        let py = y((p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio).log10());
+        scatter.push_str(&format!(
+            "<circle cx='{px}' cy='{py}' r='5' fill='{}'/><text x='{}' y='{py}'>{}</text>",
+            if p.included { "#efbc50" } else { "#aa647c" },
+            px + 8.,
+            i + 1
+        ));
+    }
+    scatter.push_str("</svg>");
+    el("cal-power-scatter").set_inner_html(&scatter);
+    markers(&c.app.borrow(), &c);
+    let n = c.points.len();
+    save(&c);
+    drop(c);
+    for i in 0..n {
+        let st = state.clone();
+        let _ = on(&format!("cal-edit-{i}"), "click", move |_| {
+            let mut c = st.borrow_mut();
+            let saved = c.points[i].clone();
+            let Some(profile) = c
+                .fits
+                .as_ref()
+                .and_then(|f| {
+                    f.profiles
+                        .iter()
+                        .find(|p| p.start_unix == saved.ion_start_unix)
+                })
+                .cloned()
+            else {
+                text("cal-result","Select a broad-gate point first to load the one-minute fits, then edit this saved point.");
+                return;
+            };
+            c.pending = Some(Pending {
+                time: saved.time_unix,
+                start: saved.plasma_start_unix,
+                end: saved.plasma_end_unix,
+                broad: saved.broad_gate - 1,
+                frequency: saved.frequency_hz,
+                profile,
+            });
+            c.editing = Some(i);
+            input("cal-frequency").set_value(&(saved.frequency_hz / 1e6).to_string());
+            input("cal-time-width").set_value(&saved.power_time_window_s.to_string());
+            input("cal-range-width").set_value(&saved.power_altitude_width_km.to_string());
+            let app = c.app.borrow();
+            let elevation = app.m.frames[0].elevation_deg;
+            drop(app);
+            let bounds = [[47., 221.], [128., 302.], [209., 383.], [290., 464.]]
+                [saved.broad_gate - 1]
+                .map(|r| altitude(r, elevation));
+            candidates(&c, bounds);
+            let gate = c
+                .pending
+                .as_ref()
+                .unwrap()
+                .profile
+                .gates
+                .iter()
+                .position(|g| (g.altitude_km - saved.altitude_km).abs() < 0.01)
+                .unwrap_or(0);
+            el("cal-altitude")
+                .dyn_into::<HtmlSelectElement>()
+                .unwrap()
+                .set_value(&gate.to_string());
+            input("cal-height").set_value(&saved.altitude_km.to_string());
+            text(
+                "cal-selection",
+                &format!("Editing point {} · {} UTC", i + 1, utc(saved.time_unix)),
+            );
+            preview(&c);
+        });
+        let st = state.clone();
+        let _ = on(&format!("cal-use-{i}"), "change", move |_| {
+            st.borrow_mut().points[i].included = input(&format!("cal-use-{i}")).checked();
+            table(&st);
+        });
+        let st = state.clone();
+        let _ = on(&format!("cal-remove-{i}"), "click", move |_| {
+            st.borrow_mut().points.remove(i);
+            st.borrow_mut().editing = None;
+            table(&st);
+        });
+    }
+}
+fn candidates(c: &Calibration, bounds: [f64; 2]) {
+    let Some(p) = &c.pending else {
+        return;
+    };
+    input("cal-height").set_min(&bounds[0].to_string());
+    input("cal-height").set_max(&bounds[1].to_string());
+    input("cal-height").set_value(&((bounds[0] + bounds[1]) / 2.).to_string());
+    let s = c.settings.as_ref().unwrap();
+    let mut options = String::from("<option value=''>Select source altitude…</option>");
+    let mut plot=String::from("<svg viewBox='0 0 650 300' role='img' aria-label='Candidate altitude versus predicted plasma frequency' style='width:100%;max-width:700px;font:12px system-ui;fill:#c8d5e0'>");
+    for i in 0..=4 {
+        let h = bounds[0] + (bounds[1] - bounds[0]) * i as f64 / 4.;
+        let y = 255. - 210. * i as f64 / 4.;
+        plot.push_str(&format!("<path d='M60,{y} H610' stroke='#344652'/><text x='55' y='{}' text-anchor='end'>{h:.0}</text>",y+4.));
+    }
+    for f in 2..=6 {
+        let x = 60. + 550. * (f as f64 - 1.) / 6.;
+        plot.push_str(&format!(
+            "<text x='{x}' y='279' text-anchor='middle'>{f}</text>"
+        ));
+    }
+    plot.push_str("<text x='325' y='298' text-anchor='middle'>|Frequency offset| / MHz</text><text x='60' y='20'>Altitude / km · fitted-density prediction; gold = eligible fit</text>");
+    let picked = 60. + 550. * (p.frequency.abs() / 1e6 - 1.) / 6.;
+    plot.push_str(&format!(
+        "<path d='M{picked},35 V255' stroke='#a9fff3' stroke-dasharray='4 4'/>"
+    ));
+    for (i, g) in p.profile.gates.iter().enumerate() {
+        if g.altitude_km < bounds[0] || g.altitude_km > bounds[1] {
+            continue;
+        }
+        let Some(f) = &g.result else {
+            continue;
+        };
+        let predicted = frequency_hz(
+            f.plasma.electron_density_m3,
+            f.plasma.electron_temperature_k,
+            s.radar_frequency_hz,
+        ) / 1e6;
+        options.push_str(&format!(
+            "<option value='{i}'>{:.1} km · predicted {:.3} MHz · {}</option>",
+            g.altitude_km, predicted, g.status
+        ));
+        if (1. ..=7.).contains(&predicted) {
+            let x = 60. + 550. * (predicted - 1.) / 6.;
+            let y = 255. - 210. * (g.altitude_km - bounds[0]) / (bounds[1] - bounds[0]);
+            plot.push_str(&format!("<circle cx='{x}' cy='{y}' r='4' fill='{}'><title>{:.1} km; {:.3} MHz</title></circle>",if safe_fit(g){"#efbc50"}else{"#aa647c"},g.altitude_km,predicted));
+        }
+    }
+    plot.push_str("</svg>");
+    el("cal-candidates").set_inner_html(&plot);
+    el("cal-altitude").set_inner_html(&options);
+}
+pub(super) fn start(app: State) -> Result<(), JsValue> {
+    let points = web_sys::window()
+        .unwrap()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|s| s.get_item(KEY).ok().flatten())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let state = Rc::new(RefCell::new(Calibration {
+        suppress_click: false,
+        app: app.clone(),
+        response: None,
+        editing: None,
+        settings: None,
+        fits: None,
+        pending: None,
+        points,
+        request: 0,
+    }));
+    app.borrow_mut().calibration = Some(state.clone());
+    gestures(&state)?;
+    table(&state);
+    for id in [
+        "cal-altitude",
+        "cal-frequency",
+        "cal-time-width",
+        "cal-range-width",
+        "cal-height",
+    ] {
+        let s = state.clone();
+        on(id, "input", move |_| {
+            let c = s.borrow();
+            if let Some(p) = &c.pending {
+                if id == "cal-altitude" {
+                    if let Ok(i) = el("cal-altitude")
+                        .dyn_into::<HtmlSelectElement>()
+                        .unwrap()
+                        .value()
+                        .parse::<usize>()
+                    {
+                        input("cal-height").set_value(&p.profile.gates[i].altitude_km.to_string());
+                    }
+                }
+                if id == "cal-height" {
+                    let h = input("cal-height").value().parse::<f64>().unwrap_or(0.);
+                    let index = p
+                        .profile
+                        .gates
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| g.result.is_some())
+                        .min_by(|(_, a), (_, b)| {
+                            (a.altitude_km - h)
+                                .abs()
+                                .total_cmp(&(b.altitude_km - h).abs())
+                        })
+                        .map(|(i, _)| i);
+                    if let Some(i) = index {
+                        el("cal-altitude")
+                            .dyn_into::<HtmlSelectElement>()
+                            .unwrap()
+                            .set_value(&i.to_string());
+                    }
+                }
+            }
+            preview(&c);
+        })?;
+    }
+    for event_name in ["pointerdown", "pointermove"] {
+        let st = state.clone();
+        on("cal-candidates", event_name, move |event| {
+            let Ok(e) = event.dyn_into::<web_sys::MouseEvent>() else {
+                return;
+            };
+            if event_name == "pointermove" && e.buttons() != 1 {
+                return;
+            }
+            let c = st.borrow();
+            let Some(p) = &c.pending else {
+                return;
+            };
+            let rect = el("cal-candidates")
+                .query_selector("svg")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            let fraction = ((e.client_y() as f64 - rect.top()) / rect.height() * 300. - 45.) / 210.;
+            let app = c.app.borrow();
+            let elevation = app.m.frames[0].elevation_deg;
+            let bounds = [[47., 221.], [128., 302.], [209., 383.], [290., 464.]][p.broad]
+                .map(|r| altitude(r, elevation));
+            let h = bounds[1] - fraction.clamp(0., 1.) * (bounds[1] - bounds[0]);
+            let index = p
+                .profile
+                .gates
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| {
+                    g.result.is_some() && g.altitude_km >= bounds[0] && g.altitude_km <= bounds[1]
+                })
+                .min_by(|(_, a), (_, b)| {
+                    (a.altitude_km - h)
+                        .abs()
+                        .total_cmp(&(b.altitude_km - h).abs())
+                })
+                .map(|(i, _)| i);
+            if let Some(i) = index {
+                input("cal-height").set_value(&h.to_string());
+                el("cal-altitude")
+                    .dyn_into::<HtmlSelectElement>()
+                    .unwrap()
+                    .set_value(&i.to_string());
+                drop(app);
+                preview(&c);
+            }
+        })?;
+    }
+    let s = state.clone();
+    on("cal-add", "click", move |_| {
+        let p = point(&s.borrow());
+        match p {
+            Ok(p) => {
+                let mut c = s.borrow_mut();
+                if let Some(i) = c.editing.take() {
+                    c.points[i] = p;
+                } else {
+                    c.points.push(p);
+                }
+                drop(c);
+                table(&s);
+                text(
+                    "cal-result",
+                    "Point saved. Click another feature or select another altitude.",
+                );
+            }
+            Err(e) => text("cal-result", &e),
+        }
+    })?;
+    for broad in 0..4 {
+        let st = state.clone();
+        let app = app.clone();
+        on(&format!("broad{broad}"), "click", move |event| {
+            if st.borrow().suppress_click {
+                st.borrow_mut().suppress_click = false;
+                return;
+            }
+            if !input("cal-enabled").checked() {
+                return;
+            }
+            let Ok(event) = event.dyn_into::<web_sys::MouseEvent>() else {
+                return;
+            };
+            let rect = el(&format!("broad{broad}")).get_bounding_client_rect();
+            let x = ((event.client_x() as f64 - rect.left()) / rect.width())
+                .clamp(0., 1. - f64::EPSILON);
+            let y = (1. - (event.client_y() as f64 - rect.top()) / rect.height())
+                .clamp(0., 1. - f64::EPSILON);
+            let a = app.borrow();
+            let dt = a.m.frames[0].end_unix - a.m.frames[0].start_unix;
+            let columns = ((a.view_end - a.view_start) / dt).ceil().max(1.);
+            let t = a.view_start
+                + ((x * columns).floor() + 0.5) / columns * (a.view_end - a.view_start);
+            let Some(frame) =
+                a.m.frames
+                    .iter()
+                    .find(|f| f.start_unix <= t && f.end_unix > t)
+            else {
+                text("cal-result", "No plasma data at this time (gap).");
+                return;
+            };
+            let start = frame.start_unix;
+            let end = frame.end_unix;
+            let elevation = frame.elevation_deg;
+            let centers = frame.centers_hz;
+            let low = centers[0].min(centers[1]) - 1.25e6;
+            let high = centers[0].max(centers[1]) + 1.225e6;
+            let first = ((a.broad_frequency[0] - low) / 25000.).ceil().max(0.);
+            let last = ((a.broad_frequency[1].min(high) - low) / 25000.).floor();
+            let freq = low + (first + (y * (last - first + 1.)).floor()) * 25000.;
+            let selected =
+                a.m.frames
+                    .iter()
+                    .position(|f| f.start_unix == start)
+                    .unwrap();
+            let hit = st.borrow().points.iter().position(|p| {
+                p.broad_gate == broad + 1
+                    && ((p.time_unix - t) / (a.view_end - a.view_start) * rect.width()).abs() < 10.
+                    && ((p.frequency_hz - freq) / (a.broad_frequency[1] - a.broad_frequency[0])
+                        * rect.height())
+                    .abs()
+                        < 10.
+            });
+            if let Some(i) = hit {
+                drop(a);
+                {
+                    let mut c = st.borrow_mut();
+                    c.points.remove(i);
+                    c.pending = None;
+                    c.editing = None;
+                }
+                table(&st);
+                return;
+            }
+
+            drop(a);
+            input("cal-frequency").set_value(&format!("{:.6}", freq / 1e6));
+            text(
+                "cal-selection",
+                &format!(
+                    "Broad gate {} · {}–{} UTC · {:.3} MHz (25 kHz bin)",
+                    broad + 1,
+                    utc(start),
+                    utc(end),
+                    freq / 1e6
+                ),
+            );
+            text("cal-result", "Loading matching one-minute fits…");
+            st.borrow_mut().request += 1;
+            let request = st.borrow().request;
+            st.borrow_mut().pending = None;
+            st.borrow_mut().editing = None;
+            el("cal-altitude").set_inner_html("<option value=''>Loading…</option>");
+            let st = st.clone();
+            let app = app.clone();
+            spawn_local(async move {
+                let result: Result<(), JsValue> = async {
+                    if st.borrow().settings.is_none() {
+                        let settings: Settings = json("calibration-config.json").await?;
+                        st.borrow_mut().settings = Some(settings);
+                    }
+                    if st.borrow().response.is_none() {
+                        let response: Response = json("data/beata-short-lag-response.json").await?;
+                        st.borrow_mut().response = Some(response);
+                    }
+                    if st.borrow().fits.is_none() {
+                        let url = st.borrow().settings.as_ref().unwrap().ion_index_url.clone();
+                        let fits: Fits = json(&url).await?;
+                        st.borrow_mut().fits = Some(fits);
+                    }
+                    if st.borrow().request != request {
+                        return Ok(());
+                    }
+                    let profile = st
+                        .borrow()
+                        .fits
+                        .as_ref()
+                        .unwrap()
+                        .profiles
+                        .iter()
+                        .find(|p| {
+                            p.start_unix <= t
+                                && p.end_unix > t
+                                && (p.end_unix - p.start_unix - 60.).abs() < 0.01
+                        })
+                        .cloned()
+                        .ok_or_else(|| error("No one-minute fit covers the selected time"))?;
+                    let range = [[47., 221.], [128., 302.], [209., 383.], [290., 464.]][broad];
+                    let bounds = range.map(|r| altitude(r, elevation));
+                    st.borrow_mut().pending = Some(Pending {
+                        time: t,
+                        start,
+                        end,
+                        broad,
+                        frequency: freq,
+                        profile,
+                    });
+                    candidates(&st.borrow(), bounds);
+                    set_height(&st.borrow(), (bounds[0] + bounds[1]) / 2.);
+                    select(app, selected).await?;
+                    let candidate = point(&st.borrow());
+                    if let Ok(mut p) = candidate {
+                        p.included = false; // Source altitude is provisional until the user places the point.
+                        let mut c = st.borrow_mut();
+                        let i = c.points.len();
+                        c.points.push(p);
+                        c.editing = Some(i);
+                    }
+                    table(&st);
+                    preview(&st.borrow());
+                    Ok(())
+                }
+                .await;
+                if let Err(e) = result {
+                    if st.borrow().request == request {
+                        text("cal-result", &format!("Calibration unavailable: {e:?}"));
+                    }
+                }
+            });
+        })?;
+    }
+    Ok(())
+}
+
+fn set_height(c: &Calibration, h: f64) {
+    let Some(p) = &c.pending else { return };
+    let lo = input("cal-height").min().parse::<f64>().unwrap_or(40.);
+    let hi = input("cal-height").max().parse::<f64>().unwrap_or(470.);
+    let h = h.clamp(lo, hi);
+    input("cal-height").set_value(&h.to_string());
+    if let Some((i, _)) = p
+        .profile
+        .gates
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.result.is_some())
+        .min_by(|(_, a), (_, b)| {
+            (a.altitude_km - h)
+                .abs()
+                .total_cmp(&(b.altitude_km - h).abs())
+        })
+    {
+        el("cal-altitude")
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap()
+            .set_value(&i.to_string());
+    }
+}
+pub(super) fn markers(a: &App, c: &Calibration) {
+    let mut layers = vec![String::new(); 5];
+    let mut profile = String::new();
+    let f = &a.m.frames[a.selected];
+
+    for (i, saved) in c.points.iter().enumerate() {
+        let p = saved;
+        let color = if c.editing == Some(i) {
+            "#a9fff3"
+        } else {
+            "#ffce58"
+        };
+        let tx = (p.time_unix - a.view_start) / (a.view_end - a.view_start);
+        let fy = (a.broad_frequency[1] + 12500. - p.frequency_hz)
+            / (a.broad_frequency[1] - a.broad_frequency[0] + 25000.);
+        let ay = (a.profile_altitude[1] - p.altitude_km)
+            / (a.profile_altitude[1] - a.profile_altitude[0]);
+        let label = format!("{} · {:.3} MHz", i + 1, p.frequency_hz / 1e6);
+        let dot = |x: f64, y: f64| {
+            format!("<circle cx='{x}' cy='{y}' r='6' fill='#10232b' stroke='{color}' stroke-width='2'/><text x='{}' y='{}' fill='{color}' font-size='12'>{label}</text>",x+9.,y-9.)
+        };
+        if (0. ..=1.).contains(&tx) {
+            let b = p.broad_gate - 1;
+            if (0. ..=1.).contains(&fy) {
+                let r = el(&format!("broad{b}")).get_bounding_client_rect();
+                layers[b].push_str(&dot(tx * r.width(), fy * r.height()));
+            }
+            if (0. ..=1.).contains(&ay) {
+                let r = el("power").get_bounding_client_rect();
+                layers[4].push_str(&dot(tx * r.width(), ay * r.height()));
+            }
+        }
+        if p.plasma_start_unix < f.end_unix
+            && p.plasma_end_unix > f.start_unix
+            && (0. ..=1.).contains(&ay)
+        {
+            let px = 52.
+                + 280. * (p.raw_ne_proxy_m3 / a.profile_power[0]).log10()
+                    / (a.profile_power[1] / a.profile_power[0]).log10();
+            if (52. ..=332.).contains(&px) {
+                profile.push_str(&dot(px, 30. + 280. * ay));
+                let expected = p.raw_ne_proxy_m3 * p.estimate.calibration_multiplier_ratio;
+                let ex = 52.
+                    + 280. * (expected / a.profile_power[0]).log10()
+                        / (a.profile_power[1] / a.profile_power[0]).log10();
+                if (52. ..=332.).contains(&ex) {
+                    profile.push_str(&format!(
+                        "<rect x='{}' y='{}' width='8' height='8' fill='none' stroke='{color}'/>",
+                        ex - 4.,
+                        26. + 280. * ay
+                    ));
+                }
+            }
+        }
+    }
+    for (i, layer) in layers.iter().enumerate() {
+        let id = if i == 4 {
+            "power".into()
+        } else {
+            format!("broad{i}")
+        };
+        let r = el(&id).get_bounding_client_rect();
+        let target = if i == 4 {
+            "cal-power".into()
+        } else {
+            format!("cal-broad-{i}")
+        };
+        el(&target).set_inner_html(&format!(
+            "<svg width='100%' height='100%' viewBox='0 0 {} {}'>{layer}</svg>",
+            r.width(),
+            r.height()
+        ));
+    }
+    if let Ok(Some(svg)) = el("profile").query_selector("svg") {
+        if let Ok(Some(old)) = svg.query_selector("#cal-markers") {
+            old.remove();
+        }
+        let g = doc()
+            .create_element_ns(Some("http://www.w3.org/2000/svg"), "g")
+            .unwrap();
+        let _ = g.set_attribute("id", "cal-markers");
+        g.set_inner_html(&profile);
+        let _ = svg.append_child(&g);
+    }
+}
+#[derive(Clone, Copy)]
+struct Drag {
+    x: f64,
+    y: f64,
+    px: i32,
+    py: i32,
+    point: Option<usize>,
+    moved: bool,
+}
+fn coords(id: &str, e: &web_sys::PointerEvent) -> (f64, f64) {
+    let target = if id == "profile" {
+        el(id).query_selector("svg").unwrap().unwrap()
+    } else {
+        el(id)
+    };
+    let r = target.get_bounding_client_rect();
+    let mut x = (e.client_x() as f64 - r.left()) / r.width();
+    let mut y = (e.client_y() as f64 - r.top()) / r.height();
+    if id == "profile" {
+        x = (x * 360. - 52.) / 280.;
+        y = (y * 360. - 30.) / 280.;
+    }
+    (x.clamp(0., 1.), y.clamp(0., 1.))
+}
+fn gestures(state: &Cal) -> Result<(), JsValue> {
+    for id in ["broad0", "broad1", "broad2", "broad3", "power", "profile"] {
+        let _ = el(id).set_attribute(
+            "style",
+            "touch-action:none;cursor:crosshair;position:relative",
+        );
+        let drag: Rc<RefCell<Option<Drag>>> = Rc::new(RefCell::new(None));
+        let st = state.clone();
+        let d = drag.clone();
+        on(id, "pointerdown", move |event| {
+            let Ok(e) = event.dyn_into::<web_sys::PointerEvent>() else {
+                return;
+            };
+            if e.button() != 0 {
+                return;
+            }
+            st.borrow_mut().suppress_click = false;
+            e.prevent_default();
+            let (x, y) = coords(id, &e);
+            let c = st.borrow();
+            let a = c.app.borrow();
+            let r = el(id).get_bounding_client_rect();
+            let hit = c
+                .points
+                .iter()
+                .enumerate()
+                .find(|(_, p)| {
+                    let (xx, yy) = if id == "profile" {
+                        let f = &a.m.frames[a.selected];
+                        if p.plasma_end_unix <= f.start_unix || p.plasma_start_unix >= f.end_unix {
+                            return false;
+                        }
+                        (
+                            (p.raw_ne_proxy_m3 / a.profile_power[0]).log10()
+                                / (a.profile_power[1] / a.profile_power[0]).log10(),
+                            (a.profile_altitude[1] - p.altitude_km)
+                                / (a.profile_altitude[1] - a.profile_altitude[0]),
+                        )
+                    } else if id == "power" {
+                        (
+                            (p.time_unix - a.view_start) / (a.view_end - a.view_start),
+                            (a.profile_altitude[1] - p.altitude_km)
+                                / (a.profile_altitude[1] - a.profile_altitude[0]),
+                        )
+                    } else {
+                        return false;
+                    };
+                    ((xx - x) * r.width()).abs() < 14. && ((yy - y) * r.height()).abs() < 14.
+                })
+                .map(|(i, _)| i);
+            drop(a);
+            drop(c);
+            if let Some(i) = hit {
+                el(&format!("cal-edit-{i}"))
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .unwrap()
+                    .click();
+            }
+            *d.borrow_mut() = Some(Drag {
+                x,
+                y,
+                px: e.client_x(),
+                py: e.client_y(),
+                point: hit,
+                moved: false,
+            });
+            let _ = el(id).set_pointer_capture(e.pointer_id());
+        })?;
+        let st = state.clone();
+        let d = drag.clone();
+        on(id, "pointermove", move |event| {
+            let Ok(e) = event.dyn_into::<web_sys::PointerEvent>() else {
+                return;
+            };
+            let Some(mut drag) = *d.borrow() else { return };
+            drag.moved |= (e.client_x() - drag.px)
+                .abs()
+                .max((e.client_y() - drag.py).abs())
+                > 5;
+            *d.borrow_mut() = Some(drag);
+            if !drag.moved {
+                return;
+            }
+            let (x, y) = coords(id, &e);
+            if drag.point.is_some() {
+                let c = st.borrow();
+                let bounds = c.app.borrow().profile_altitude;
+                set_height(&c, bounds[1] - y * (bounds[1] - bounds[0]));
+                let p = point(&c);
+                drop(c);
+                if let (Some(i), Ok(p)) = (drag.point, p) {
+                    st.borrow_mut().points[i] = p;
+                }
+                preview(&st.borrow());
+                return;
+            }
+            let r = el(id).get_bounding_client_rect();
+            let (left, top, w, h) = if id == "profile" {
+                (
+                    (52. + 280. * x.min(drag.x)) / 360.,
+                    (30. + 280. * y.min(drag.y)) / 360.,
+                    280. * (x - drag.x).abs() / 360.,
+                    280. * (y - drag.y).abs() / 360.,
+                )
+            } else {
+                (
+                    x.min(drag.x),
+                    y.min(drag.y),
+                    (x - drag.x).abs(),
+                    (y - drag.y).abs(),
+                )
+            };
+            let overlay = if let Some(v) = doc().get_element_by_id("cal-brush") {
+                v
+            } else {
+                let v = doc().create_element("div").unwrap();
+                let _ = v.set_attribute("id", "cal-brush");
+                let _ = doc().body().unwrap().append_child(&v);
+                v
+            };
+            let _=overlay.set_attribute("style",&format!("position:fixed;pointer-events:none;z-index:9999;border:1px solid #a9fff3;background:#a9fff333;left:{}px;top:{}px;width:{}px;height:{}px",r.left()+left*r.width(),r.top()+top*r.height(),w*r.width(),h*r.height()));
+        })?;
+        let st = state.clone();
+        let d = drag.clone();
+        on(id, "pointerup", move |event| {
+            let Ok(e) = event.dyn_into::<web_sys::PointerEvent>() else {
+                return;
+            };
+            let Some(drag) = d.borrow_mut().take() else {
+                return;
+            };
+            let _ = el(id).release_pointer_capture(e.pointer_id());
+            if let Some(b) = doc().get_element_by_id("cal-brush") {
+                b.remove();
+            }
+            let (x, y) = coords(id, &e);
+            if let Some(i) = drag.point {
+                if drag.moved {
+                    let p = point(&st.borrow());
+                    if let Ok(p) = p {
+                        st.borrow_mut().points[i] = p;
+                    }
+                } else {
+                    let mut c = st.borrow_mut();
+                    c.points.remove(i);
+                    c.pending = None;
+                    c.editing = None;
+                }
+                table(&st);
+                return;
+            }
+            if !drag.moved {
+                if id == "power" || id == "profile" {
+                    if id == "power" {
+                        let mut c = st.borrow_mut();
+                        let app = c.app.clone();
+                        let a = app.borrow();
+                        let t = a.view_start + x * (a.view_end - a.view_start);
+                        let frame =
+                            a.m.frames
+                                .iter()
+                                .find(|f| f.start_unix <= t && f.end_unix > t);
+                        let fit = c
+                            .fits
+                            .as_ref()
+                            .and_then(|fs| {
+                                fs.profiles
+                                    .iter()
+                                    .find(|p| p.start_unix <= t && p.end_unix > t)
+                            })
+                            .cloned();
+                        if let (Some(f), Some(fit), Some(p)) = (frame, fit, c.pending.as_mut()) {
+                            p.time = (f.start_unix + f.end_unix) / 2.;
+                            p.start = f.start_unix;
+                            p.end = f.end_unix;
+                            p.profile = fit;
+                            c.editing = None;
+                        } else {
+                            text("cal-result","Select a plasma-line frequency in a broad gate first; a matching one-minute fit is required.");
+                            return;
+                        }
+                    }
+                    let c = st.borrow();
+                    let bounds = c.app.borrow().profile_altitude;
+                    set_height(&c, bounds[1] - y * (bounds[1] - bounds[0]));
+                    let p = point(&c);
+                    drop(c);
+                    if let Ok(p) = p {
+                        let mut c = st.borrow_mut();
+                        if let Some(i) = c.editing {
+                            c.points[i] = p;
+                        } else {
+                            let i = c.points.len();
+                            c.points.push(p);
+                            c.editing = Some(i);
+                        }
+                        drop(c);
+                        table(&st);
+                    }
+                }
+                return;
+            }
+            st.borrow_mut().suppress_click = id.starts_with("broad");
+            let app = st.borrow().app.clone();
+            let mut a = app.borrow_mut();
+            if (x - drag.x).abs() > 0.005 && (y - drag.y).abs() > 0.005 {
+                if id == "profile" {
+                    let [lo, hi] = a.profile_power;
+                    a.profile_power = [
+                        lo * (hi / lo).powf(x.min(drag.x)),
+                        lo * (hi / lo).powf(x.max(drag.x)),
+                    ];
+                } else {
+                    let lo = a.view_start;
+                    let span = a.view_end - lo;
+                    a.view_start = lo + x.min(drag.x) * span;
+                    a.view_end = lo + x.max(drag.x) * span;
+                }
+                if id.starts_with("broad") {
+                    let [lo, hi] = a.broad_frequency;
+                    a.broad_frequency = [
+                        hi - y.max(drag.y) * (hi - lo),
+                        hi - y.min(drag.y) * (hi - lo),
+                    ];
+                } else {
+                    let [lo, hi] = a.profile_altitude;
+                    let lower = hi - y.max(drag.y) * (hi - lo);
+                    let upper = hi - y.min(drag.y) * (hi - lo);
+                    if upper - lower >= 3. {
+                        a.profile_altitude = [lower, upper];
+                    }
+                }
+            }
+            let _ = overview(&a);
+        })?;
+        let d = drag.clone();
+        on(id, "pointercancel", move |_| {
+            *d.borrow_mut() = None;
+            if let Some(b) = doc().get_element_by_id("cal-brush") {
+                b.remove();
+            }
+        })?;
+        let st = state.clone();
+        on(id, "contextmenu", move |e| {
+            e.prevent_default();
+            let app = st.borrow().app.clone();
+            let mut a = app.borrow_mut();
+            if id != "profile" {
+                a.view_start = a.m.frames[0].start_unix;
+                a.view_end = a.m.frames.last().unwrap().end_unix;
+            }
+            if id.starts_with("broad") {
+                a.broad_frequency = [-6.15e6, -1.275e6];
+            } else {
+                a.profile_altitude = [40., 400.];
+                a.profile_power = [1e8, 1e13];
+            }
+            let _ = overview(&a);
+        })?;
+    }
+    Ok(())
+}

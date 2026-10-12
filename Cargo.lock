@@ -521,6 +521,7 @@ name = "guisdap-web"
 version = "0.1.0"
 dependencies = [
  "guisdap-core",
+ "guisdap-ion",
  "js-sys",
  "serde",
  "serde_json",

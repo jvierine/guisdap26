@@ -1,5 +1,6 @@
 //! Static-hosted browser application. Data selection, scaling, UI and WebGL live in Rust.
 #![cfg(target_arch = "wasm32")]
+mod calibration;
 mod ion;
 use guisdap_core::{merge_bands, native_spectra};
 use serde::Deserialize;
@@ -42,6 +43,10 @@ struct Manifest {
     overview_root: String,
 }
 struct App {
+    calibration: Option<calibration::Cal>,
+    profile_altitude: [f64; 2],
+    profile_power: [f64; 2],
+    broad_frequency: [f64; 2],
     root: String,
     m: Manifest,
     broad: Vec<f32>,
@@ -55,10 +60,8 @@ struct App {
     decoded_selected: Option<usize>,
     raw_view: bool,
     percentile: f64,
-    playing: bool,
     busy: bool,
     request: u64,
-    speed: f64,
     smoothing: usize,
     magnitude: bool,
     weighted: bool,
@@ -338,7 +341,7 @@ fn overview(a: &App) -> Result<(), JsValue> {
                 }
             }
         }
-        let (merged, bins, _) =
+        let (merged, bins, low) =
             merge_bands(&bands, n, 100, a.m.frames[0].centers_hz, 25000.).map_err(error)?;
         let mut history = vec![0.; bins * n];
         for t in 0..n {
@@ -346,17 +349,31 @@ fn overview(a: &App) -> Result<(), JsValue> {
                 history[f * n + t] = merged[t * bins + f];
             }
         }
-        all_history.push((history, bins));
+        all_history.push((history, bins, low));
     }
     let combined: Vec<f32> = all_history
         .iter()
-        .flat_map(|(h, _)| h.iter().copied())
+        .flat_map(|(h, _, _)| h.iter().copied())
         .collect();
     let shared_limit = percentile(&combined, a.percentile);
     let bounds = [[47., 221.], [128., 302.], [209., 383.], [290., 464.]];
     let elevation = a.m.frames[a.selected].elevation_deg;
-    for (gate, (history, bins)) in all_history.iter().enumerate() {
-        let visible: Vec<f32> = (0..*bins)
+    for (gate, (history, bins, low)) in all_history.iter().enumerate() {
+        let first =
+            (((a.broad_frequency[0] - low) / 25000.).ceil().max(0.) as usize).min(*bins - 1);
+        let last = (((a.broad_frequency[1] - low) / 25000.)
+            .floor()
+            .max(first as f64) as usize)
+            .min(*bins - 1);
+        text(
+            &format!("broad-high-{gate}"),
+            &format!("{:.3}", (low + last as f64 * 25000.) / 1e6),
+        );
+        text(
+            &format!("broad-low-{gate}"),
+            &format!("{:.3}", (low + first as f64 * 25000.) / 1e6),
+        );
+        let visible: Vec<f32> = (first..=last)
             .flat_map(|f| {
                 columns
                     .iter()
@@ -367,7 +384,7 @@ fn overview(a: &App) -> Result<(), JsValue> {
             &format!("broad{gate}"),
             &visible,
             width,
-            *bins,
+            last - first + 1,
             a.percentile,
             cursor,
             (Some(shared_limit), a.raw_view),
@@ -384,14 +401,14 @@ fn overview(a: &App) -> Result<(), JsValue> {
     }
     let elevation = a.m.frames[0].elevation_deg;
     let shift = 0.;
-    let minimum = 40.;
+    let minimum = a.profile_altitude[0];
     let indices: Vec<usize> =
         a.m.ion_range_km
             .iter()
             .enumerate()
             .filter_map(|(i, &r)| {
                 let h = altitude(r - shift, elevation);
-                if (minimum..=400.0).contains(&h) {
+                if (minimum..=a.profile_altitude[1]).contains(&h) {
                     Some(i)
                 } else {
                     None
@@ -452,13 +469,19 @@ fn overview(a: &App) -> Result<(), JsValue> {
 fn profile(a: &App, indices: &[usize]) {
     let n = a.m.frames.len();
     let f = &a.m.frames[a.selected];
-    // Fixed log bounds across every integration; never rectify stored estimates.
-    let x = |v: f64| 52. + (v.max(1e8).log10().clamp(8., 13.) - 8.) * 56.;
-    let y = |h: f64| 310. - (h - 40.) / 360. * 280.;
-    let mut svg=String::from("<svg viewBox='0 0 360 360' role='img' aria-label='Signed 10 microsecond lag raw electron density versus response-centroid altitude, logarithmic scale 10^8 to 10^13 per cubic metre, with one sigma uncertainty'><g font-family='monospace' font-size='10' fill='#8b9aa8'>");
-    for h in (40..=400).step_by(10) {
+    let [bottom, top] = a.profile_altitude;
+    let [xmin, xmax] = a.profile_power;
+    let x = |v: f64| {
+        52. + 280. * (v.max(xmin).min(xmax).log10() - xmin.log10()) / (xmax / xmin).log10()
+    };
+    let y = |h: f64| 310. - 280. * (h - bottom) / (top - bottom);
+    let mut svg=String::from("<svg preserveAspectRatio='none' viewBox='0 0 360 360' role='img' aria-label='Signed 10 microsecond lag raw electron density versus response-centroid altitude, logarithmic scale 10^8 to 10^13 per cubic metre, with one sigma uncertainty'><g font-family='monospace' font-size='10' fill='#8b9aa8'>");
+    let tick = (((top - bottom) / 7. / 5.).ceil() * 5.).max(1.) as i32;
+    for h in
+        ((bottom / tick as f64).ceil() as i32 * tick..=top.floor() as i32).step_by(tick as usize)
+    {
         let yy = y(h as f64);
-        if h % 50 == 0 {
+        if true {
             svg += &format!(
                 "<path d='M52 {yy} H332' stroke='#293743'/><text x='12' y='{}'>{h}</text>",
                 yy + 4.
@@ -467,7 +490,7 @@ fn profile(a: &App, indices: &[usize]) {
             svg += &format!("<path d='M46 {yy} H52' stroke='#72878e'/>");
         }
     }
-    for exp in 8..=13 {
+    for exp in xmin.log10().ceil() as i32..=xmax.log10().floor() as i32 {
         let xx = x(10f64.powi(exp));
         svg += &format!("<path d='M{xx} 30 V310' stroke='#293743'/>");
         if let Ok(label) = math_power(&exp.to_string(), xx, 332., "middle") {
@@ -478,20 +501,24 @@ fn profile(a: &App, indices: &[usize]) {
     let mut connected = false;
     let mut nonpositive = 0;
     for &i in indices {
+        let h = altitude(a.m.ion_range_km[i], f.elevation_deg);
+        if h < bottom || h > top {
+            continue;
+        }
         let v = a.power[i * n + a.selected] as f64;
         let se = a.power_sigma[i * n + a.selected] as f64;
         let yy = y(altitude(a.m.ion_range_km[i], f.elevation_deg));
         let lo = v - se;
         let hi = v + se;
-        if hi > 1e8 && lo < 1e13 {
+        if hi > xmin && lo < xmax {
             svg+=&format!("<path d='M{} {yy:.2} H{}' stroke='#80dfce' stroke-opacity='.35'><title>Raw Ne {v:.3e} ± {se:.3e} m⁻³ (1σ)</title></path>",x(lo),x(hi));
         }
         if v <= 0. {
             nonpositive += 1;
         }
-        if !(1e8..=1e13).contains(&v) {
+        if !(xmin..=xmax).contains(&v) {
             connected = false;
-            let xx = if v < 1e8 { 52. } else { 332. };
+            let xx = if v < xmin { 52. } else { 332. };
             svg+=&format!("<path d='M{xx} {yy:.2} l4 -2 v4 z' fill='#e8ac69'><title>Outside logarithmic display: {v:.3e} ± {se:.3e} m⁻³</title></path>");
         } else {
             let op = if connected { "L" } else { "M" };
@@ -502,6 +529,11 @@ fn profile(a: &App, indices: &[usize]) {
     }
     svg+=&format!("<path d='{path}' stroke='#80dfce' fill='none' stroke-width='1.4'/><text x='190' y='352' text-anchor='middle'>Raw Ne / m⁻³ · log scale</text></g></svg>");
     el("profile").set_inner_html(&svg);
+    if let Some(c) = &a.calibration {
+        if let Ok(c) = c.try_borrow() {
+            calibration::markers(a, &c);
+        }
+    }
     text("power-uncertainty",&format!("Horizontal bars: approximate ±1σ from 14 short integrations plus calibration. Clutter-induced covariance and systematic errors are not included. {nonpositive} nonpositive estimates in the displayed altitude interval; edge markers show values outside the log axis. Signed estimates remain in HDF5."));
 }
 fn decoded(a: &mut App) -> Result<(), JsValue> {
@@ -609,8 +641,6 @@ async fn select(state: State, index: usize) -> Result<(), JsValue> {
     let data = match result {
         Ok(d) => d,
         Err(e) => {
-            a.playing = false;
-            text("play", "Play");
             return Err(e);
         }
     };
@@ -659,11 +689,6 @@ async fn select(state: State, index: usize) -> Result<(), JsValue> {
     decoded(&mut a)?;
     Ok(())
 }
-fn pause(state: &State) {
-    state.borrow_mut().playing = false;
-    text("play", "Play");
-}
-
 fn on(
     id: &str,
     event: &str,
@@ -776,6 +801,10 @@ pub async fn start() -> Result<(), JsValue> {
         .unwrap_or(last.end_unix)
         .clamp(view_start + dt, last.end_unix);
     let state = Rc::new(RefCell::new(App {
+        calibration: None,
+        profile_altitude: [40., 400.],
+        profile_power: [1e8, 1e13],
+        broad_frequency: [-6.15e6, -1.275e6],
         root,
         m,
         broad,
@@ -789,10 +818,8 @@ pub async fn start() -> Result<(), JsValue> {
         decoded_selected: None,
         raw_view: false,
         percentile: 0.995,
-        playing: true,
         busy: false,
         request: 0,
-        speed: 2.,
         smoothing: 4,
         magnitude: true,
         weighted: true,
@@ -823,7 +850,6 @@ pub async fn start() -> Result<(), JsValue> {
     ] {
         let s = state.clone();
         on(id, "click", move |_| {
-            pause(&s);
             let mut a = s.borrow_mut();
             let first = a.m.frames[0].start_unix;
             let last = a.m.frames.last().unwrap().end_unix;
@@ -843,7 +869,6 @@ pub async fn start() -> Result<(), JsValue> {
     }
     let s = state.clone();
     on("time", "input", move |_| {
-        pause(&s);
         let s = s.clone();
         let i = el("time")
             .dyn_into::<HtmlInputElement>()
@@ -858,28 +883,7 @@ pub async fn start() -> Result<(), JsValue> {
             }
         });
     })?;
-    for (id, direction) in [("previous", -1isize), ("next", 1)] {
-        let s = state.clone();
-        on(id, "click", move |_| {
-            pause(&s);
-            let s = s.clone();
-            let i = {
-                let a = s.borrow();
-                let lo = a.m.frames.partition_point(|f| f.end_unix <= a.view_start);
-                let hi =
-                    a.m.frames
-                        .partition_point(|f| f.start_unix < a.view_end)
-                        .saturating_sub(1);
-                (a.selected as isize + direction).clamp(lo as isize, hi as isize) as usize
-            };
-            spawn_local(async move {
-                if let Err(e) = select(s, i).await {
-                    report(e);
-                }
-            });
-        })?;
-    }
-    for id in ["baseline", "stretch", "mode", "smooth", "weight", "speed"] {
+    for id in ["baseline", "stretch", "mode", "smooth", "weight"] {
         let s = state.clone();
         on(id, "change", move |_| {
             let mut a = s.borrow_mut();
@@ -912,12 +916,6 @@ pub async fn start() -> Result<(), JsValue> {
                 .unwrap()
                 .value()
                 == "sqrt";
-            a.speed = el("speed")
-                .dyn_into::<HtmlSelectElement>()
-                .unwrap()
-                .value()
-                .parse()
-                .unwrap_or(2.);
             if matches!(id, "mode" | "smooth" | "weight" | "stretch") {
                 a.limit = None;
             }
@@ -935,46 +933,8 @@ pub async fn start() -> Result<(), JsValue> {
             }
         })?;
     }
-    let s = state.clone();
-    on("play", "click", move |_| {
-        let mut a = s.borrow_mut();
-        a.playing = !a.playing;
-        text("play", if a.playing { "Pause" } else { "Play" });
-    })?;
     select(state.clone(), initial).await?;
-    text("play", "Pause");
-    let s = state.clone();
-    let mut last = js_sys::Date::now();
-    let tick = Closure::<dyn FnMut()>::new(move || {
-        let now = js_sys::Date::now();
-        let next = {
-            let a = s.borrow();
-            if !a.playing || a.busy || now - last < 1000. / a.speed {
-                return;
-            }
-            let lo = a.m.frames.partition_point(|f| f.end_unix <= a.view_start);
-            let hi = a.m.frames.partition_point(|f| f.start_unix < a.view_end);
-            if a.selected + 1 >= hi {
-                lo
-            } else {
-                a.selected + 1
-            }
-        };
-        last = now;
-        let s = s.clone();
-        spawn_local(async move {
-            if let Err(e) = select(s, next).await {
-                report(e);
-            }
-        });
-    });
-    web_sys::window()
-        .unwrap()
-        .set_interval_with_callback_and_timeout_and_arguments_0(
-            tick.as_ref().unchecked_ref(),
-            50,
-        )?;
-    tick.forget();
+    calibration::start(state.clone())?;
     Ok(())
 }
 

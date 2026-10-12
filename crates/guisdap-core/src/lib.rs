@@ -1,4 +1,5 @@
 //! BEATA 2.2 quick-look signal processing, independent of file and network I/O.
+pub mod calibration;
 pub mod quality;
 use anyhow::{ensure, Result};
 use rustfft::{num_complex::Complex, FftPlanner};
