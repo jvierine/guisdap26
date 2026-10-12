@@ -1,4 +1,5 @@
 //! Ion-fit inspection. All interaction and plotting run in Rust/WASM.
+mod instruments;
 mod raster;
 use super::{el, error, json, text};
 use serde::Deserialize;
@@ -102,12 +103,15 @@ struct Dataset {
 }
 #[derive(Deserialize)]
 struct Location {
+    #[serde(default)]
+    instruments_url: Option<String>,
     datasets: Vec<Dataset>,
     #[serde(default)]
     study_status_url: Option<String>,
 }
 type MapKey = (u64, u64, usize, usize, usize, i64);
 struct Viewer {
+    instruments: Option<instruments::Data>,
     data: Data,
     time: usize,
     gate: usize,
@@ -546,6 +550,7 @@ fn acf(v: &Viewer, component: usize) -> String {
     s
 }
 fn render(v: &Viewer) {
+    instruments::render(v);
     let p = selected(v);
     let g = &p.gates[v.gate];
     let altitude_slider: HtmlInputElement = el("fit-altitude").dyn_into().unwrap();
@@ -834,7 +839,29 @@ async fn change_resolution(state: Rc<RefCell<Viewer>>, resolution: usize) -> Res
         let mut v = state.borrow_mut();
         let start = v.window_start;
         let end = v.window_end;
+        let old = &v.data.profiles[v.time].gates;
+        let low = old[v.lower].lower_km;
+        let high = old[v.upper].upper_km;
+        let height = old[v.gate].altitude_km;
         v.data = data;
+        let gates = &v.data.profiles[0].gates;
+        let lower = gates
+            .partition_point(|g| g.upper_km <= low)
+            .min(gates.len() - 1);
+        let upper = gates
+            .partition_point(|g| g.lower_km < high)
+            .saturating_sub(1)
+            .max(lower);
+        let gate = gates
+            .partition_point(|g| g.upper_km <= height)
+            .clamp(lower, upper);
+        let max = (gates.len() - 1).to_string();
+        v.lower = lower;
+        v.upper = upper;
+        v.gate = gate;
+        for id in ["fit-altitude", "fit-altitude-min", "fit-altitude-max"] {
+            el(id).dyn_into::<HtmlInputElement>()?.set_max(&max);
+        }
         v.resolution = resolution;
         v.time = fit_index(&v.data, target);
         v.details.clear();
@@ -916,6 +943,11 @@ pub async fn start_ion() -> Result<(), JsValue> {
     if location.datasets.is_empty() {
         return Err(error("no configured resolutions"));
     }
+    let instruments = if let Some(url) = &location.instruments_url {
+        json::<instruments::Data>(url).await.ok()
+    } else {
+        None
+    };
     let data: Data = json(&location.datasets[0].data_url).await?;
     if data.schema != "beata22-ionfit-v2" || data.profiles.is_empty() {
         return Err(error("unsupported or empty ion product"));
@@ -958,6 +990,7 @@ pub async fn start_ion() -> Result<(), JsValue> {
     let mut statuses = vec![None; location.datasets.len()];
     statuses[0] = data.processing.clone();
     let state = Rc::new(RefCell::new(Viewer {
+        instruments,
         window_start: data.profiles[0].start_unix,
         window_end: data.profiles.last().unwrap().end_unix,
         data,

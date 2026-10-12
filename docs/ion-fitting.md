@@ -212,3 +212,24 @@ The residual cutoff is optional and defaults off because correlated lags and
 few-record variance estimates invalidate a simple chi-square interpretation.
 Colour settings update on input and also have explicit Apply buttons with applied
 limits shown. The selected-time parameter axes use the same configured limits.
+
+### Instrument diagnostics
+
+The ion viewer loads an optional `instruments_url` from `ion-config.json`. The
+native-record traces share the parameter-map UTC window and selected-time cursor;
+the selected interval readout uses overlap-duration weighted means. Missing
+records/calibration remain gaps. This series is independent of fit resolution and
+quality masking, allowing instrument changes to be compared with rejected fits.
+
+`cargo run --release -p guisdap-worker --example export_instruments -- INPUT_FRAMES OUTPUT.h5 OUTPUT.json`
+exports the recorded transmitter power (`d_parbl[7]`, watts), elevation (`[8]`) and
+azimuth (`[9]`), plus ion-channel system noise temperature in kelvin. Zero-based
+background addresses 0..16 and calibration-on addresses 16..32 have the same
+1/512 normalization used by the fitter. With the recorded injected calibration
+temperature `d_parbl[20]`, `Tsys = B * Tcal / (C - B)`. Nonpositive calibration
+excess, negative background, or invalid injection temperature gives a missing
+estimate. This uses means, matching the current fitter (legacy `scale_data.m`
+uses medians). It estimates receiver-plus-sky noise, not electron temperature.
+Absolute calibration uncertainty is not estimated. Internal data is retained in
+HDF5; the static browser consumes the atomic JSON export. Export once per source
+collection, and refresh when records are added.
